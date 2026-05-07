@@ -37,6 +37,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import logging
+import os
 import sys
 import types
 from dataclasses import dataclass, field
@@ -45,6 +46,20 @@ from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled
+from hermes_cli.config import cfg_get
+
+
+def get_bundled_plugins_dir() -> Path:
+    """Locate the bundled ``plugins/`` directory.
+
+    Honours ``HERMES_BUNDLED_PLUGINS`` (set by the Nix wrapper / packaged
+    installs) so read-only store paths are consulted first.  Falls back to
+    the in-repo path used during development.
+    """
+    env_override = os.getenv("HERMES_BUNDLED_PLUGINS")
+    if env_override:
+        return Path(env_override)
+    return Path(__file__).resolve().parent.parent / "plugins"
 
 try:
     import yaml
@@ -71,16 +86,33 @@ VALID_HOOKS: Set[str] = {
     "on_session_finalize",
     "on_session_reset",
     "subagent_stop",
+    # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
+    # after the internal-event guard but BEFORE auth/pairing and agent
+    # dispatch. Plugins may return a dict to influence flow:
+    #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
+    #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
+    #   {"action": "allow"}  /  None             -> normal dispatch
+    # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
+    "pre_gateway_dispatch",
+    # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
+    # command needs user approval -- fires BOTH for CLI-interactive prompts
+    # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
+    # Observers only: return values are ignored. Plugins cannot veto or
+    # pre-answer an approval from these hooks (use pre_tool_call to block
+    # a tool before it reaches approval).
+    #
+    # Kwargs for pre_approval_request:
+    #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
+    #   session_key: str, surface: "cli" | "gateway"
+    # Kwargs for post_approval_response: same as above plus
+    #   choice: "once" | "session" | "always" | "deny" | "timeout"
+    "pre_approval_request",
+    "post_approval_response",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
-
-# Where bundled (repo-shipped) plugins live. Exposed as a module-level
-# variable so tests can monkeypatch the discovery root without dropping
-# fake plugins into the real ``<repo>/plugins/`` tree.
-_BUNDLED_PLUGIN_DIR: Path = Path(__file__).resolve().parent.parent / "plugins"
 
 
 def _env_enabled(name: str) -> bool:
@@ -98,7 +130,7 @@ def _get_disabled_plugins() -> set:
     try:
         from hermes_cli.config import load_config
         config = load_config()
-        disabled = config.get("plugins", {}).get("disabled", [])
+        disabled = cfg_get(config, "plugins", "disabled", default=[])
         return set(disabled) if isinstance(disabled, list) else set()
     except Exception:
         return set()
@@ -138,7 +170,7 @@ def _get_enabled_plugins() -> Optional[set]:
 # Data classes
 # ---------------------------------------------------------------------------
 
-_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive"}
+_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform"}
 
 
 @dataclass
@@ -164,6 +196,11 @@ class PluginManifest:
     #              Selection via ``<category>.provider`` config key; the
     #              category's own discovery system handles loading and the
     #              general scanner skips these.
+    # ``platform``: gateway messaging platform adapter (e.g. IRC). Bundled
+    #              platform plugins auto-load so every shipped platform is
+    #              available out of the box; user-installed platform plugins
+    #              in ~/.hermes/plugins/ still gated by ``plugins.enabled``
+    #              (untrusted code).
     kind: str = "standalone"
     # Registry key — path-derived, used by ``plugins.enabled``/``disabled``
     # lookups and by ``hermes plugins list``. For a flat plugin at
@@ -171,17 +208,6 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
-    # When True AND the plugin is bundled (shipped with the repo), the
-    # general loader auto-loads it without requiring ``plugins.enabled``.
-    # Reserved for plugins that are passive observers (no side effects on
-    # tool results, no extra API cost) and need to "just work" out of the
-    # box — e.g. ``self_learning`` which only watches for recurring tool
-    # errors and emits soft system_hints. Users can still disable an
-    # auto-enabled plugin by adding it to ``plugins.disabled`` in config.
-    # Has no effect for ``backend`` (auto-loaded by other rule) or
-    # ``exclusive`` (handled by category discovery) kinds, and is ignored
-    # for non-bundled sources (user/project/entrypoint stay opt-in).
-    auto_enable: bool = False
 
 
 @dataclass
@@ -438,6 +464,62 @@ class PluginContext:
             self.manifest.name, provider.name,
         )
 
+    # -- platform adapter registration ---------------------------------------
+
+    def register_platform(
+        self,
+        name: str,
+        label: str,
+        adapter_factory: Callable,
+        check_fn: Callable,
+        validate_config: Callable | None = None,
+        required_env: list | None = None,
+        install_hint: str = "",
+        **entry_kwargs: Any,
+    ) -> None:
+        """Register a gateway platform adapter.
+
+        The adapter_factory receives a ``PlatformConfig`` and returns a
+        ``BasePlatformAdapter`` subclass instance.  The gateway calls
+        ``check_fn()`` before instantiation to verify dependencies.
+
+        Extra keyword arguments are forwarded to ``PlatformEntry`` (e.g.
+        ``setup_fn``, ``emoji``, ``allowed_users_env``, ``platform_hint``).
+        Unknown keys raise TypeError from the dataclass constructor.
+
+        Example::
+
+            ctx.register_platform(
+                name="irc",
+                label="IRC",
+                adapter_factory=lambda cfg: IRCAdapter(cfg),
+                check_fn=lambda: True,
+                emoji="💬",
+                setup_fn=irc_interactive_setup,
+            )
+        """
+        from gateway.platform_registry import platform_registry, PlatformEntry
+
+        entry_kwargs.setdefault("plugin_name", self.manifest.name)
+        entry = PlatformEntry(
+            name=name,
+            label=label,
+            adapter_factory=adapter_factory,
+            check_fn=check_fn,
+            validate_config=validate_config,
+            required_env=required_env or [],
+            install_hint=install_hint,
+            source="plugin",
+            **entry_kwargs,
+        )
+        platform_registry.register(entry)
+        self._manager._plugin_platform_names.add(name)
+        logger.debug(
+            "Plugin %s registered platform: %s",
+            self.manifest.name,
+            name,
+        )
+
     # -- hook registration --------------------------------------------------
 
     def register_hook(self, hook_name: str, callback: Callable) -> None:
@@ -516,6 +598,7 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
+        self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
@@ -558,14 +641,18 @@ class PluginManager:
         #   - category: ``plugins/image_gen/openai/plugin.yaml`` (backend)
         #
         # ``memory/`` and ``context_engine/`` are skipped at the top level —
-        # they have their own discovery systems. Porting those to the
-        # category-namespace ``kind: exclusive`` model is a future PR.
+        # they have their own discovery systems. ``platforms/`` is a category
+        # holding platform adapters (scanned one level deeper below).
+        repo_plugins = get_bundled_plugins_dir()
         manifests.extend(
             self._scan_directory(
-                _BUNDLED_PLUGIN_DIR,
+                repo_plugins,
                 source="bundled",
-                skip_names={"memory", "context_engine"},
+                skip_names={"memory", "context_engine", "platforms"},
             )
+        )
+        manifests.extend(
+            self._scan_directory(repo_plugins / "platforms", source="bundled")
         )
 
         # 2. User plugins (~/.hermes/plugins/)
@@ -623,21 +710,11 @@ class PluginManager:
             # just work. Selection among them (e.g. which image_gen backend
             # services calls) is driven by ``<category>.provider`` config,
             # enforced by the tool wrapper.
-            if manifest.kind == "backend" and manifest.source == "bundled":
-                self._load_plugin(manifest)
-                continue
-
-            # Bundled standalone plugins that explicitly opt-in via
-            # ``auto_enable: true`` in their manifest also auto-load.
-            # Reserved for passive observers (e.g. self_learning) where
-            # requiring an explicit ``plugins.enabled`` entry would defeat
-            # the purpose of "just works out of the box". Users can still
-            # disable via ``plugins.disabled`` (checked above).
-            if (
-                manifest.kind == "standalone"
-                and manifest.source == "bundled"
-                and manifest.auto_enable
-            ):
+            #
+            # Bundled platform plugins (gateway adapters like IRC) auto-load
+            # for the same reason: every platform Hermes ships must be
+            # available out of the box without the user having to opt in.
+            if manifest.source == "bundled" and manifest.kind in ("backend", "platform"):
                 self._load_plugin(manifest)
                 continue
 
@@ -809,11 +886,6 @@ class PluginManager:
                     except Exception:
                         pass
 
-            auto_enable_raw = data.get("auto_enable", False)
-            auto_enable = bool(auto_enable_raw) if isinstance(
-                auto_enable_raw, (bool, int, str)
-            ) else False
-
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -826,7 +898,6 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
-                auto_enable=auto_enable,
             )
         except Exception as exc:
             logger.warning("Failed to parse %s: %s", manifest_file, exc)
@@ -1019,18 +1090,9 @@ class PluginManager:
     # -----------------------------------------------------------------------
 
     def list_plugins(self) -> List[Dict[str, Any]]:
-        """Return a list of info dicts for all discovered plugins.
-
-        Sorted by display ``name`` (not registry ``key``) so the result
-        ordering matches what the user sees in ``hermes plugins list``.
-        Sorting by ``key`` would leak path prefixes (``image_gen/xai``
-        sorts before ``self_learning`` even though its display name
-        ``xai`` should sort after) — that mismatch broke this contract
-        when the first plugin landed between ``image_gen/*`` and a
-        non-prefixed plugin name in dictionary order.
-        """
+        """Return a list of info dicts for all discovered plugins."""
         result: List[Dict[str, Any]] = []
-        for _key, loaded in self._plugins.items():
+        for key, loaded in sorted(self._plugins.items()):
             result.append(
                 {
                     "name": loaded.manifest.name,
@@ -1046,7 +1108,6 @@ class PluginManager:
                     "error": loaded.error,
                 }
             )
-        result.sort(key=lambda p: p["name"])
         return result
 
     # -----------------------------------------------------------------------

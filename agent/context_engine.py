@@ -88,13 +88,15 @@ class ContextEngine(ABC):
         DAG, or do anything else — as long as the returned list is a valid
         OpenAI-format message sequence.
 
-        ``focus_topic`` is an optional hint string that the agent's loop
-        passes when compression is triggered around a specific topic
-        (e.g. the user's most recent question).  Engines that summarize
-        can use it to bias what to keep verbatim; engines that retrieve
-        (LCM) may ignore it or use it as a search seed.  Implementations
-        MUST accept this kwarg even if they don't act on it — see the
-        run_agent.py call site that always passes it.
+        Args:
+            focus_topic: Optional topic string. May come from the manual
+                ``/compress <focus>`` command, or from the agent loop when
+                compression is triggered around a specific topic (e.g. the
+                user's most recent question). Engines that summarize should
+                use it to bias what to keep verbatim; engines that retrieve
+                (e.g. LCM) may ignore it or use it as a search seed.
+                Implementations MUST accept this kwarg even if they don't
+                act on it — the ``run_agent.py`` call site always passes it.
         """
 
     # -- Optional: pre-flight check ----------------------------------------
@@ -106,6 +108,21 @@ class ContextEngine(ABC):
         can do a cheap estimate.
         """
         return False
+
+    # -- Optional: manual /compress preflight ------------------------------
+
+    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+        """Quick check: is there anything in ``messages`` that can be compacted?
+
+        Used by the gateway ``/compress`` command as a preflight guard —
+        returning False lets the gateway report "nothing to compress yet"
+        without making an LLM call.
+
+        Default returns True (always attempt).  Engines with a cheap way
+        to introspect their own head/tail boundaries should override this
+        to return False when the transcript is still entirely protected.
+        """
+        return True
 
     # -- Optional: session lifecycle ---------------------------------------
 

@@ -70,3 +70,47 @@ def profile_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     return home
 ```
+
+## BOOT.md built-in hook removed (upstream v0.12.0)
+
+The `boot-md` built-in gateway hook was removed in upstream PR #17093. The
+`gateway/builtin_hooks/` directory is now an extension point with **no shipped
+hooks**. Old comments referring to "boot-md" are obsolete.
+
+## TUI clipboard — three-tier strategy & headless gotchas (upstream v0.12.0)
+
+Hermes TUI clipboard handling uses a three-tier strategy. The order matters
+because tier 1 fails or hangs in headless environments.
+
+1. **Native OS tools** (`pbcopy`, `wl-copy`, `xclip`, `xsel`, `clip.exe`) — only
+   when a display server is present (`$DISPLAY` for X11 or `$WAYLAND_DISPLAY`
+   for Wayland). On Linux in headless environments (Docker, remote SSH without
+   X11 forwarding), these tools fail or hang. The code short-circuits
+   immediately if both env vars are unset.
+2. **tmux buffer** (`tmux load-buffer`) — when inside a tmux session; requires
+   `set-clipboard on` for system clipboard propagation.
+3. **OSC 52 escape** — written to stdout; the terminal emulator must intercept
+   and set the clipboard. Support varies: iTerm2 disables it by default,
+   VS Code may block it behind a permission prompt, raw PTYs without an
+   emulator drop it silently.
+
+**Environment variables:**
+
+| Variable | Purpose |
+|---|---|
+| `HERMES_TUI_CLIPBOARD_OSC52` / `HERMES_TUI_COPY_OSC52` | Force OSC 52 emission (`1`/`true`) or disable (`0`/`false`). Ignored when native tools are expected to work (macOS local, or Linux with `$DISPLAY/$WAYLAND_DISPLAY`). |
+| `HERMES_TUI_DEBUG_CLIPBOARD` | Set to `1` to log detailed debug info to stderr about which clipboard path is taken. |
+| `SSH_CONNECTION` | Presence indicates an SSH session; gates native tool usage and prefers OSC 52. |
+| `TMUX`, `STY` | Tmux/screen detection for passthrough or buffer loading. |
+
+**Common false-positive**: The "copied selection" UI message displays
+**unconditionally** after Ctrl+C, even if all clipboard mechanisms fail. In a
+headless Docker container or non-OSC52-capable terminal you'll see the message
+but nothing is copied. Use `HERMES_TUI_DEBUG_CLIPBOARD=1` to diagnose.
+
+**Dashboard caveat**: The dashboard's `Ctrl+C` path relies on
+OSC 52 → xterm's handler → browser Clipboard API. Because the Clipboard API
+requires a user gesture, this can fail if the OSC 52 response arrives outside
+the key event's activation window. Use `Ctrl+Shift+C` (Cmd+Shift+C on macOS)
+as a reliable fallback — it calls `navigator.clipboard.writeText()` directly
+inside the key handler.

@@ -31,6 +31,40 @@ def _make_cli_stub():
     return cli
 
 
+def _make_background_cli_stub():
+    cli = _make_cli_stub()
+    cli._background_task_counter = 0
+    cli._background_tasks = {}
+    cli._ensure_runtime_credentials = MagicMock(return_value=True)
+    cli._resolve_turn_agent_config = MagicMock(return_value={
+        "model": "test-model",
+        "runtime": {
+            "api_key": "test-key",
+            "base_url": "https://example.test/v1",
+            "provider": "test",
+            "api_mode": "chat_completions",
+        },
+        "request_overrides": None,
+    })
+    cli.max_turns = 90
+    cli.enabled_toolsets = []
+    cli._session_db = None
+    cli.reasoning_config = {}
+    cli.service_tier = None
+    cli._providers_only = None
+    cli._providers_ignore = None
+    cli._providers_order = None
+    cli._provider_sort = None
+    cli._provider_require_params = None
+    cli._provider_data_collection = None
+    cli._fallback_model = None
+    cli._agent_running = False
+    cli._spinner_text = ""
+    cli.bell_on_complete = False
+    cli.final_response_markdown = "strip"
+    return cli
+
+
 class TestCliApprovalUi:
     def test_sudo_prompt_restores_existing_draft_after_response(self):
         cli = _make_cli_stub()
@@ -266,18 +300,18 @@ class TestCliApprovalUi:
         """
         cli = _make_cli_stub()
         long_cmd = (
-            "cd ~/.hermes/project-knowledge/diancaibao-app && PYTHONPATH=. "
-            "~/PyCharmMiscProject/hermes-agent-main/venv/bin/python -c \""
-            "from automation.adb import ADB; from automation.vl_engine "
-            "import VLEngine; import json; adb = ADB(device_id='a8a52e58'); "
+            "cd /tmp/sample-project && PYTHONPATH=. "
+            "/tmp/sample-venv/bin/python -c \""
+            "from sample_pkg.adb import ADB; from sample_pkg.vl_engine "
+            "import VLEngine; import json; adb = ADB(device_id='aaaaaaaa'); "
             "path = adb.screenshot(); print('Screenshot:', path); "
             "vl = VLEngine(); from openai import OpenAI; import os, base64; "
             "client = OpenAI(api_key=os.environ.get('AUTO_UI_API_KEY'), "
             "base_url=os.environ.get('AUTO_UI_BASE_URL')); "
-            "model = os.environ.get('AUTO_UI_MODEL', 'qwen3-vl-plus'); "
-            "请详细描述这个页面的所有UI元素。"
-            "我需要知道：1)员工号输入框的位置坐标 "
-            "2)同意条款复选框的位置坐标 3)登录按钮的位置坐标\""
+            "model = os.environ.get('AUTO_UI_MODEL', 'sample-vl-model'); "
+            "describe every UI element on this screen in detail. "
+            "I need to know: 1) the employee-id input box coordinates, "
+            "2) the agreement checkbox coordinates, 3) the login button coordinates.\""
         )
         cli._approval_state = {
             "command": long_cmd,
@@ -316,16 +350,64 @@ class TestCliApprovalUi:
             line for line in lines
             if line.startswith("│ ") and (
                 "AUTO_UI" in line
-                or "PyCharmMiscProject" in line
+                or "sample-project" in line
                 or "command truncated" in line
-                or "automation" in line
-                or ".hermes" in line
+                or "sample_pkg" in line
+                or "sample-venv" in line
             )
         ]
         assert len(cmd_body_lines) <= 8, (
             f"command body lines should be capped at 8, got {len(cmd_body_lines)}: "
             f"{cmd_body_lines!r}"
         )
+
+    def test_background_task_registers_thread_local_approval_callbacks(self):
+        """Background /btw tasks must use the prompt_toolkit approval UI.
+
+        The foreground chat path registers dangerous-command callbacks inside
+        its worker thread because tools.terminal_tool stores them in
+        threading.local(). /background used to skip that, so dangerous commands
+        fell back to raw input() in a background thread and timed out under
+        prompt_toolkit.
+        """
+        cli = _make_background_cli_stub()
+        seen = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                self._print_fn = None
+                self.thinking_callback = None
+
+            def run_conversation(self, **kwargs):
+                from tools.terminal_tool import (
+                    _get_approval_callback,
+                    _get_sudo_password_callback,
+                )
+
+                seen["approval"] = _get_approval_callback()
+                seen["sudo"] = _get_sudo_password_callback()
+                return {
+                    "final_response": "done",
+                    "messages": [],
+                    "completed": True,
+                    "failed": False,
+                }
+
+        with patch.object(cli_module, "AIAgent", FakeAgent), \
+             patch.object(cli_module, "_cprint"), \
+             patch.object(cli_module, "ChatConsole") as chat_console:
+            chat_console.return_value.print = MagicMock()
+            cli._handle_background_command("/btw check weather")
+
+            deadline = time.time() + 2
+            while cli._background_tasks and time.time() < deadline:
+                time.sleep(0.01)
+
+        assert seen["approval"].__self__ is cli
+        assert seen["approval"].__func__ is HermesCLI._approval_callback
+        assert seen["sudo"].__self__ is cli
+        assert seen["sudo"].__func__ is HermesCLI._sudo_password_callback
+        assert not cli._background_tasks
 
 
 class TestApprovalCallbackThreadLocalWiring:
