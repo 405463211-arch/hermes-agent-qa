@@ -42,7 +42,13 @@ jobs:
   #   4. Uses a GitHub App token (not GITHUB_TOKEN) so the fix commit
   #      triggers downstream nix.yml verification.
   auto-fix-main:
-    if: github.event_name == 'push'
+    # Skip on forks that don't have the GitHub App secrets configured.
+    # The upstream repo (NousResearch/hermes-agent) provisions APP_ID and
+    # APP_PRIVATE_KEY so the auto-commit step can push to main with a token
+    # that triggers downstream nix.yml verification. Forks without those
+    # secrets would fail at the very first step (`Input required: app-id`),
+    # so we gate the entire job on the upstream repository name.
+    if: github.event_name == 'push' && github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     concurrency:
