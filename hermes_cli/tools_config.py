@@ -78,7 +78,29 @@ CONFIGURABLE_TOOLSETS = [
 # Toolsets that are OFF by default for new installs.
 # They're still in _HERMES_CORE_TOOLS (available at runtime if enabled),
 # but the setup checklist won't pre-select them for first-time users.
-_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl", "spotify", "discord", "discord_admin"}
+#
+# ``learning`` / ``obsidian`` / ``project_knowledge`` are local fork additions
+# (toolsets defined in ``toolsets.py`` from snapshot 6198fe35f). They MUST
+# stay opt-in because:
+#   * ``obsidian_*`` tools are gated on ``obsidian.enabled`` config — without
+#     a configured vault they're useless.
+#   * ``learning_*`` is auto-driven by the ``self_learning`` plugin
+#     (see ``plugins/self_learning/plugin.yaml``), users invoke them
+#     indirectly; surfacing them in every platform's default toolset
+#     pollutes the prompt for users who haven't opted into the loop.
+#   * ``project_knowledge_*`` requires a populated knowledge tree.
+# Keeping them in _DEFAULT_OFF_TOOLSETS also makes _get_platform_tools'
+# non-configurable-toolset recovery loop skip them, which is what the
+# upstream tests
+#   - test_get_platform_tools_preserves_explicit_empty_selection
+#   - test_load_enabled_toolsets_rejects_disabled_mcp_env
+#   - test_load_enabled_toolsets_falls_back_when_tui_env_invalid
+# implicitly assume (they don't know about these local toolsets).
+_DEFAULT_OFF_TOOLSETS = {
+    "moa", "homeassistant", "rl", "spotify", "discord", "discord_admin",
+    # Local fork additions — see comment block above.
+    "learning", "obsidian", "project_knowledge",
+}
 
 # Platform-scoped toolsets: only appear in the `hermes tools` checklist for
 # these platforms, and only resolve/save for these platforms.  A toolset

@@ -124,8 +124,13 @@ class TestMcpRegistrationE2E:
         mock_conn.request_permission = AsyncMock()
         acp_agent._conn = mock_conn
 
-        def mock_run_conversation(user_message, conversation_history=None, task_id=None):
-            """Simulate an agent turn that calls terminal, gets a result, then responds."""
+        def mock_run_conversation(user_message, conversation_history=None, task_id=None, **kwargs):
+            """Simulate an agent turn that calls terminal, gets a result, then responds.
+
+            ``**kwargs`` swallows forward-compat kwargs that ``acp_adapter.server``
+            adds over time (currently ``persist_user_message=`` from
+            ``cdf9793d6 fix(acp): advertise and forward image prompts``).
+            """
             agent = state.agent
 
             # 1) Agent fires tool_progress_callback (ToolCallStart)
@@ -213,7 +218,7 @@ class TestMcpRegistrationE2E:
         mock_conn.request_permission = AsyncMock()
         acp_agent._conn = mock_conn
 
-        def mock_run(user_message, conversation_history=None, task_id=None):
+        def mock_run(user_message, conversation_history=None, task_id=None, **kwargs):
             agent = state.agent
             # Fire two tool calls
             if agent.tool_progress_callback:

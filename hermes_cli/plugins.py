@@ -52,10 +52,19 @@ from hermes_cli.config import cfg_get
 def get_bundled_plugins_dir() -> Path:
     """Locate the bundled ``plugins/`` directory.
 
-    Honours ``HERMES_BUNDLED_PLUGINS`` (set by the Nix wrapper / packaged
-    installs) so read-only store paths are consulted first.  Falls back to
-    the in-repo path used during development.
+    Resolution order (highest priority first):
+
+    1. ``_BUNDLED_PLUGIN_DIR`` module attribute — set to a Path by tests via
+       ``monkeypatch.setattr(plmod, "_BUNDLED_PLUGIN_DIR", tmp_dir)`` so the
+       discovery root can be redirected without dropping fake plugins into
+       the real ``<repo>/plugins/`` tree. Production code never sets it.
+    2. ``HERMES_BUNDLED_PLUGINS`` env var — set by the Nix wrapper / packaged
+       installs so read-only store paths are consulted first.
+    3. The in-repo path next to ``hermes_cli/`` — development fallback.
     """
+    test_override = globals().get("_BUNDLED_PLUGIN_DIR")
+    if test_override is not None:
+        return Path(test_override)
     env_override = os.getenv("HERMES_BUNDLED_PLUGINS")
     if env_override:
         return Path(env_override)
@@ -208,6 +217,17 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # When True AND the plugin is bundled (shipped with the repo), the
+    # general loader auto-loads it without requiring ``plugins.enabled``.
+    # Reserved for plugins that are passive observers (no side effects on
+    # tool results, no extra API cost) and need to "just work" out of the
+    # box — e.g. ``self_learning`` which only watches for recurring tool
+    # errors and emits soft system_hints. Users can still disable an
+    # auto-enabled plugin by adding it to ``plugins.disabled`` in config.
+    # Has no effect for ``backend`` (auto-loaded by other rule) or
+    # ``exclusive`` (handled by category discovery) kinds, and is ignored
+    # for non-bundled sources (user/project/entrypoint stay opt-in).
+    auto_enable: bool = False
 
 
 @dataclass
@@ -718,6 +738,20 @@ class PluginManager:
                 self._load_plugin(manifest)
                 continue
 
+            # Bundled standalone plugins that explicitly opt-in via
+            # ``auto_enable: true`` in their manifest also auto-load.
+            # Reserved for passive observers (e.g. self_learning) where
+            # requiring an explicit ``plugins.enabled`` entry would defeat
+            # the purpose of "just works out of the box". Users can still
+            # disable via ``plugins.disabled`` (checked above).
+            if (
+                manifest.kind == "standalone"
+                and manifest.source == "bundled"
+                and manifest.auto_enable
+            ):
+                self._load_plugin(manifest)
+                continue
+
             # Everything else (standalone, user-installed backends,
             # entry-point plugins) is opt-in via plugins.enabled.
             # Accept both the path-derived key and the legacy bare name
@@ -886,6 +920,11 @@ class PluginManager:
                     except Exception:
                         pass
 
+            auto_enable_raw = data.get("auto_enable", False)
+            auto_enable = bool(auto_enable_raw) if isinstance(
+                auto_enable_raw, (bool, int, str)
+            ) else False
+
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -898,6 +937,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                auto_enable=auto_enable,
             )
         except Exception as exc:
             logger.warning("Failed to parse %s: %s", manifest_file, exc)
