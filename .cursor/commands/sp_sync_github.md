@@ -46,13 +46,13 @@ git status              # 看 untracked / modified 数量
 git remote -v           # 看远端配置
 git branch --show-current   # 是否在分支上（detached HEAD 要先绑分支）
 ls .git/shallow 2>/dev/null && echo "⚠️ 是 shallow clone" || echo "✓ 完整 clone"
-git log -1 --format='%an %ae'   # 看 committer 身份是否对
+git log -1 --format='%an'       # 看 committer 名字是否对
 ```
 
 **判断点**：
 - detached HEAD？→ 先 `git switch -c main` 绑分支
 - shallow clone？→ Step 6 必须先 unshallow
-- committer email 不是 GitHub 注册邮箱？→ Step 7 设置 `git config user.name/email`
+- committer name 不是你想要的（如默认的 `<user>`）？→ Step 7 设置 `git config user.name`
 
 ---
 
@@ -184,13 +184,11 @@ git push -u origin main
 
 ### Step 7: 修正 commit 身份（可选）
 
-如果发现 committer 是 `<user>@<hostname>.local` 这种本机自动生成的：
+如果发现 committer name 是 `<user>` 这种系统默认值（不是你想要的显示名）：
 
 ```bash
 # 只为本仓库设置（不影响其他项目）
 git config user.name "<你想显示的名字>"
-git config user.email "<你的 GitHub 注册邮箱>"
-# 或用 GitHub 隐私邮箱：<id>+<username>@users.noreply.github.com
 ```
 
 **注意**：已 push 的 commit 不会自动改身份，强行 amend 会触发 force push 重写历史，建议**只对未来的 commit 生效**。
@@ -220,8 +218,6 @@ git config user.email "<你的 GitHub 注册邮箱>"
 | `error: src refspec main does not match any` | 本地不在 main 分支 / 没 commit | `git switch -c main` + `git commit` |
 | `Permission denied (publickey)` | SSH key 没配到 GitHub | `gh auth login` 或 `ssh-keygen + 加到 GitHub` |
 | `Could not access submodule '<name>' at commit <hash>` (warning) | submodule 仓库无访问权限 | 警告无害，可忽略；不影响 push |
-| 推完后 GitHub contribution graph 不增加 | committer email 不是 GitHub 注册邮箱 | Step 7 修正，从下次 commit 生效 |
-
 ---
 
 ## 以后同步上游新版本（标准动作）
