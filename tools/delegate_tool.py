@@ -1026,7 +1026,27 @@ def _run_single_child(
     """
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
+
+    For the parallel-batch path the caller passes
+    ``_parent_callbacks`` via ``_kwargs`` — a snapshot of the parent
+    thread's CLI callbacks (sudo + approval).  We restore them onto
+    THIS worker thread immediately so any nested code path that
+    inspects ``terminal_tool._callback_tls`` (notably the inner
+    ``child.run_conversation`` submit further below) sees the
+    callbacks instead of falling back to the broken daemon-thread
+    ``input()`` path in ``tools.approval`` that leaks the stdin lock.
     """
+    _parent_callbacks = _kwargs.get("_parent_callbacks")
+    if _parent_callbacks:
+        try:
+            from tools.terminal_tool import apply_thread_callbacks as _apply_cb
+            _apply_cb(_parent_callbacks)
+        except Exception as exc:
+            logger.debug(
+                "Failed to apply parent CLI callbacks in subagent worker: %s",
+                exc,
+            )
+
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -1166,13 +1186,54 @@ def _run_single_child(
 
         # Run child with a hard timeout to prevent indefinite blocking
         # when the child's API call or tool-level HTTP request hangs.
+        #
+        # IMPORTANT: propagate the parent thread's CLI callbacks
+        # (sudo_password, approval) into the worker thread.  The callbacks
+        # live in `tools.terminal_tool._callback_tls`, a `threading.local`
+        # — so without explicit propagation the subagent's worker thread
+        # has NO approval callback registered.  When the subagent then
+        # asks for approval on a dangerous command, `prompt_dangerous_approval`
+        # falls back to a daemon thread that runs `input()` against
+        # `<stdin>` and never releases the BufferedReader lock — fighting
+        # prompt_toolkit for keystrokes during the run and triggering
+        # `Fatal Python error: _enter_buffered_busy` at interpreter
+        # shutdown.  See tools/terminal_tool.py::get_thread_callbacks.
+        try:
+            from tools.terminal_tool import (
+                get_thread_callbacks as _snapshot_callbacks,
+                apply_thread_callbacks as _apply_callbacks,
+                clear_thread_callbacks as _clear_callbacks,
+            )
+            _parent_callbacks = _snapshot_callbacks()
+        except Exception:
+            _parent_callbacks = None
+            _apply_callbacks = None
+            _clear_callbacks = None
+
+        def _run_child_with_callbacks():
+            if _apply_callbacks is not None:
+                try:
+                    _apply_callbacks(_parent_callbacks)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to propagate CLI callbacks into subagent thread: %s",
+                        exc,
+                    )
+            try:
+                return child.run_conversation(
+                    user_message=goal,
+                    task_id=child_task_id,
+                )
+            finally:
+                if _clear_callbacks is not None:
+                    try:
+                        _clear_callbacks()
+                    except Exception:
+                        pass
+
         child_timeout = _get_child_timeout()
         _timeout_executor = ThreadPoolExecutor(max_workers=1)
-        _child_future = _timeout_executor.submit(
-            child.run_conversation,
-            user_message=goal,
-            task_id=child_task_id,
-        )
+        _child_future = _timeout_executor.submit(_run_child_with_callbacks)
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -1662,10 +1723,27 @@ def delegate_task(
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
+    # Snapshot the parent thread's CLI callbacks once, before we leave
+    # the parent thread.  Both the single-task path (which runs
+    # _run_single_child inline but then submits child.run_conversation
+    # to its own executor) and the parallel-batch path (which submits
+    # _run_single_child itself to the executor) need the snapshot to
+    # propagate sudo/approval callbacks into worker threads.  See
+    # tools/terminal_tool.py::get_thread_callbacks for the full
+    # rationale.
+    try:
+        from tools.terminal_tool import get_thread_callbacks as _snap_cb
+        _parent_cb_snapshot = _snap_cb()
+    except Exception:
+        _parent_cb_snapshot = None
+
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child(
+            0, _t["goal"], child, parent_agent,
+            _parent_callbacks=_parent_cb_snapshot,
+        )
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -1681,6 +1759,7 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    _parent_callbacks=_parent_cb_snapshot,
                 )
                 futures[future] = i
 

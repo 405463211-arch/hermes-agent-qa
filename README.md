@@ -1,3 +1,15 @@
+# hermes-agent-qa
+
+> 测试工程师训练 hermes agent 能力，迭代视觉 UI 自动化、接口自动化、功能用例、mockserver 等。
+>
+> 本仓库是 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 的个人 fork，
+> 基线 commit `bf196a3` (v0.11.0)，在其基础上添加了 Obsidian 集成、self-learning / LCM /
+> ui-automation 插件、white-box 探针测试套件等本地扩展。
+
+---
+
+下文为 hermes-agent 上游原始 README：
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>

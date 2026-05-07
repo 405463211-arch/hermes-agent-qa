@@ -1,0 +1,13 @@
+{
+  "name": "ui_automation",
+  "label": "UI 自动化",
+  "description": "列出 project-knowledge 下的页面 YAML、用例 YAML 与 auto-discover 预览图",
+  "icon": "Eye",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/ui-automation",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

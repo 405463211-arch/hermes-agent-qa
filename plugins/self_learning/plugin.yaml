@@ -1,0 +1,11 @@
+name: self_learning
+version: 1.0.0
+description: "Detects recurring tool errors and emits a soft system_hint nudging the agent to consider learning_record. Pure observation — never alters tool results."
+author: "NousResearch"
+# Auto-enable on first install: this plugin is a passive observer and the
+# self-learning loop only works if it's running. Users can still disable
+# via `plugins.disabled` in config.yaml.
+auto_enable: true
+hooks:
+  - post_tool_call
+  - pre_llm_call

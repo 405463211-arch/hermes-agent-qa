@@ -79,6 +79,23 @@ class TestCommandRegistry:
             "xhigh",
         )
 
+    def test_rules_command_registered_with_subcommands(self):
+        rules = resolve_command("rules")
+        assert rules is not None
+        assert "list" in rules.subcommands
+        assert "add" in rules.subcommands
+        assert "remove" in rules.subcommands
+        # Lives in Tools & Skills next to /skills
+        assert rules.category == "Tools & Skills"
+
+    def test_memory_command_registered_with_per_bucket_edit(self):
+        memory = resolve_command("memory")
+        assert memory is not None
+        # Per-bucket edit prevents the trap of editing one and forgetting others
+        assert "edit-rules" in memory.subcommands
+        assert "edit-memory" in memory.subcommands
+        assert "edit-user" in memory.subcommands
+
     def test_cli_only_and_gateway_only_are_mutually_exclusive(self):
         for cmd in COMMAND_REGISTRY:
             assert not (cmd.cli_only and cmd.gateway_only), \

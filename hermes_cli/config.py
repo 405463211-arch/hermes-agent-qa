@@ -710,16 +710,105 @@ DEFAULT_CONFIG = {
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt
+    #
+    # Three layered stores, in order of authority:
+    #   - rules:  RULES.md  — mandatory protocols / red lines (highest priority)
+    #   - memory: MEMORY.md — agent's working notes (auto-archives oldest to LCM)
+    #   - user:   USER.md   — user profile / preferences
+    #
+    # Char limits are deliberate budgets: every entry is injected into the
+    # system prompt of every future turn, so total cost = limit × turns. Bump
+    # only if you genuinely need more — prefer skills (loaded on demand) for
+    # bulky procedural knowledge.
     "memory": {
         "memory_enabled": True,
         "user_profile_enabled": True,
+        "rules_enabled": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        "rules_char_limit": 4000,    # ~1450 tokens — small budget on purpose
+        # When MEMORY.md fills up, auto-archive oldest entries to the LCM
+        # long-context store (recoverable via lcm_search).  Requires the
+        # LCM context engine to be active (context.engine: lcm).  Setting
+        # this to false reverts to the old "Memory full, please prune"
+        # error.  RULES.md and USER.md never auto-archive regardless.
+        "lcm_archive_on_overflow": True,
+        # ── Rules lifecycle (see agent/rules_lifecycle.py) ────────────────
+        # When true, RULES.md is periodically pruned to keep the bucket lean
+        # so the self-learning loop (learning_record auto-promotion) can keep
+        # writing new rules indefinitely.  Pruned rules move to
+        # RULES.archive.md (still recoverable via /rules unarchive); they are
+        # never silently deleted.  Pinned rules and recently edited/recurring
+        # rules are protected — see agent/rules_lifecycle.py for the full
+        # eviction rules.
+        "auto_archive_rules": True,
+        # Trigger A — capacity protection. When the serialized RULES.md
+        # exceeds this fraction of rules_char_limit, evict the oldest
+        # non-pinned rules until back under threshold.  Set to 0 to disable.
+        "auto_archive_capacity_threshold": 0.80,
+        # Trigger B — age-based eviction.  An auto-promoted (LRN-*) rule
+        # older than this and dormant (no recurrence, no edit, not pinned)
+        # is moved to the archive.  Manual rules never participate in B.
+        "auto_archive_age_days": 90,
+        # Protection window for both ``last_recurrence`` and ``last_edited``.
+        # If either fired inside this many days, the rule stays put.
+        "auto_archive_recurrence_window": 30,
+        # Show a notification in the CLI / gateway after each auto-archive.
+        # Set to false for headless / batch contexts where the notice would
+        # just clutter logs.
+        "archive_notify": True,
+        # How long a freshly-promoted rule wears the "[NEW]" tag in the
+        # system prompt.  This is also the protection window: rules within
+        # this many days of promotion never participate in age-based archive.
+        "trial_new_marker_days": 7,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+    },
+
+    # Obsidian vault bridge — read/write the user's Obsidian-managed
+    # Markdown notes.  Complements (does NOT replace) the built-in
+    # RULES/MEMORY/USER buckets: those stay the canonical source of
+    # truth, the vault is a human-editable mirror + ingest area.
+    #
+    # Cost note: enabling this only adds the obsidian_search/view/save
+    # tool schemas to the system prompt (~200 tokens, cached).  The
+    # tools are pay-per-call — no automatic vault content injection.
+    #
+    # See `hermes obsidian setup` for the interactive configuration
+    # wizard, and skills/productivity/hermes-obsidian-bridge/ for the
+    # full user manual.
+    "obsidian": {
+        # Master switch. When false, the obsidian tools are inert and
+        # the CLI commands print a "not configured" hint.
+        "enabled": False,
+        # Absolute path to the Obsidian vault root.  ``~`` is expanded.
+        # Leave empty until ``hermes obsidian setup`` fills it in.
+        "vault_path": "",
+        # Where the agent can search:
+        #   - "hermes_subdir" (default) — only ``vault/hermes/`` (the
+        #     hermes-managed area; the user's own notes stay private)
+        #   - "ingest"        — only ``vault/hermes/ingest/`` (a curated
+        #     whitelist of notes the user explicitly wants exposed)
+        #   - "all"           — the whole vault (only enable if you trust
+        #     the agent with everything; dailies / journals included)
+        "search_scope": "hermes_subdir",
+        # Auto-export RULES/MEMORY/USER to vault/hermes/ at session end
+        # so the user always sees fresh state in Obsidian without
+        # running `hermes obsidian export` manually.
+        "auto_export_on_session_end": True,
+        # Auto-import vault/hermes/rules-staging.md into RULES.md at
+        # session start, applying any rules the user wrote in Obsidian
+        # since the last session.  Imports happen BEFORE system-prompt
+        # build, so new rules take effect immediately.
+        "auto_import_rules_on_start": True,
+        # Mirror learning_store entries into vault/hermes/learnings/
+        # (one .md per LRN id) on each session-end export.  Skip if
+        # you find the file count overwhelming — the canonical store
+        # is still the SQLite DB.
+        "export_learnings": True,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

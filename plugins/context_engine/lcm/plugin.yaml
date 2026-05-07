@@ -1,0 +1,13 @@
+name: lcm
+description: |
+  Long Context Memory — retrieval-based context engine. Stores every
+  compressed message in a local SQLite + embeddings store and lets the
+  agent pull back specific old turns via lcm_search / lcm_recall tools
+  instead of relying on a lossy LLM-generated summary.
+
+  Especially useful for long sessions on slower providers (GLM-5.1,
+  DeepSeek-R1) where the standard compression's two extra LLM calls
+  per cycle (flush_memories + summarize) create noticeable latency.
+
+version: 0.1.0
+author: hermes-agent

@@ -190,6 +190,65 @@ def set_approval_callback(cb):
     """
     _callback_tls.approval = cb
 
+
+def get_thread_callbacks() -> dict:
+    """Snapshot the current thread's CLI callbacks (sudo + approval).
+
+    Used by ``delegate_tool`` when spawning a subagent in a worker
+    thread.  ``threading.local`` does not propagate across threads, so
+    without this snapshot+restore the subagent thread has NO approval
+    callback registered — and ``tools.approval.prompt_dangerous_approval``
+    falls back to a daemon ``threading.Thread(target=input, daemon=True)``.
+    That daemon grabs the ``<stdin>`` BufferedReader lock, never releases
+    it, and at interpreter shutdown causes::
+
+        Fatal Python error: _enter_buffered_busy: could not acquire lock
+        for <_io.BufferedReader name='<stdin>'> at interpreter shutdown,
+        possibly due to daemon threads
+
+    The same leak also fights prompt_toolkit for stdin during normal
+    operation, which is why the user sees keystrokes silently dropped
+    after a long subagent run.
+
+    Pair with :func:`apply_thread_callbacks`.
+    """
+    return {
+        "sudo_password": getattr(_callback_tls, "sudo_password", None),
+        "approval": getattr(_callback_tls, "approval", None),
+    }
+
+
+def apply_thread_callbacks(snapshot: "dict | None") -> None:
+    """Restore a callbacks snapshot into the current thread.
+
+    No-op when ``snapshot`` is falsy or when a value is ``None``; we
+    don't want to clobber a callback that the worker registered for
+    itself (e.g. the gateway's per-session callback).
+    """
+    if not snapshot:
+        return
+    sudo_cb = snapshot.get("sudo_password")
+    if sudo_cb is not None:
+        _callback_tls.sudo_password = sudo_cb
+    approval_cb = snapshot.get("approval")
+    if approval_cb is not None:
+        _callback_tls.approval = approval_cb
+
+
+def clear_thread_callbacks() -> None:
+    """Clear the current thread's callbacks (best-effort).
+
+    Used by worker threads as a teardown step so a thread that's reused
+    by ThreadPoolExecutor doesn't carry the previous task's callbacks
+    into the next.
+    """
+    for attr in ("sudo_password", "approval"):
+        if hasattr(_callback_tls, attr):
+            try:
+                delattr(_callback_tls, attr)
+            except AttributeError:
+                pass
+
 # =============================================================================
 # Dangerous Command Approval System
 # =============================================================================

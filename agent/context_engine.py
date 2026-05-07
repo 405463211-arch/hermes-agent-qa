@@ -78,6 +78,7 @@ class ContextEngine(ABC):
         self,
         messages: List[Dict[str, Any]],
         current_tokens: int = None,
+        focus_topic: str = None,
     ) -> List[Dict[str, Any]]:
         """Compact the message list and return the new message list.
 
@@ -86,6 +87,14 @@ class ContextEngine(ABC):
         context budget. The implementation is free to summarize, build a
         DAG, or do anything else — as long as the returned list is a valid
         OpenAI-format message sequence.
+
+        ``focus_topic`` is an optional hint string that the agent's loop
+        passes when compression is triggered around a specific topic
+        (e.g. the user's most recent question).  Engines that summarize
+        can use it to bias what to keep verbatim; engines that retrieve
+        (LCM) may ignore it or use it as a search seed.  Implementations
+        MUST accept this kwarg even if they don't act on it — see the
+        run_agent.py call site that always passes it.
         """
 
     # -- Optional: pre-flight check ----------------------------------------

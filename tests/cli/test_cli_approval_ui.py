@@ -255,6 +255,78 @@ class TestCliApprovalUi:
         # Command got truncated with a marker.
         assert "(command truncated" in rendered
 
+    def test_approval_display_caps_view_command_even_on_tall_terminals(self):
+        """Regression: on a tall terminal (e.g. 50+ rows), pressing /view on
+        a long multi-line command used to expand the command past the visible
+        prompt_toolkit redraw region, pushing the choices off-screen.
+
+        The hard cap of 8 logical lines for the command keeps the panel
+        compact regardless of terminal height. Users who need the full text
+        can use /logs or /debug.
+        """
+        cli = _make_cli_stub()
+        long_cmd = (
+            "cd ~/.hermes/project-knowledge/diancaibao-app && PYTHONPATH=. "
+            "~/PyCharmMiscProject/hermes-agent-main/venv/bin/python -c \""
+            "from automation.adb import ADB; from automation.vl_engine "
+            "import VLEngine; import json; adb = ADB(device_id='a8a52e58'); "
+            "path = adb.screenshot(); print('Screenshot:', path); "
+            "vl = VLEngine(); from openai import OpenAI; import os, base64; "
+            "client = OpenAI(api_key=os.environ.get('AUTO_UI_API_KEY'), "
+            "base_url=os.environ.get('AUTO_UI_BASE_URL')); "
+            "model = os.environ.get('AUTO_UI_MODEL', 'qwen3-vl-plus'); "
+            "请详细描述这个页面的所有UI元素。"
+            "我需要知道：1)员工号输入框的位置坐标 "
+            "2)同意条款复选框的位置坐标 3)登录按钮的位置坐标\""
+        )
+        cli._approval_state = {
+            "command": long_cmd,
+            "description": "shell command via -c/-lc flag",
+            "choices": ["once", "session", "always", "deny"],
+            "selected": 0,
+            "show_full": True,
+            "response_queue": queue.Queue(),
+        }
+
+        import shutil as _shutil
+
+        # Tall terminal — large enough that the old per-row math wouldn't have
+        # truncated the command. The hard cap must still kick in.
+        with patch("cli.shutil.get_terminal_size",
+                   return_value=_shutil.os.terminal_size((100, 60))):
+            fragments = cli._get_approval_display_fragments()
+
+        rendered = "".join(text for _style, text in fragments)
+        lines = rendered.splitlines()
+
+        # All four choices visible.
+        for label in ("Allow once", "Allow for this session",
+                      "Add to permanent allowlist", "Deny"):
+            assert label in rendered, f"choice {label!r} missing"
+
+        # Bottom border rendered (panel self-contained).
+        assert rendered.rstrip().endswith("╯")
+
+        # Command got truncated even on a tall terminal.
+        assert "(command truncated" in rendered
+
+        # Hard cap: at most ~8 lines of command body inside the panel,
+        # regardless of how many rows the terminal has.
+        cmd_body_lines = [
+            line for line in lines
+            if line.startswith("│ ") and (
+                "AUTO_UI" in line
+                or "PyCharmMiscProject" in line
+                or "command truncated" in line
+                or "automation" in line
+                or ".hermes" in line
+            )
+        ]
+        assert len(cmd_body_lines) <= 8, (
+            f"command body lines should be capped at 8, got {len(cmd_body_lines)}: "
+            f"{cmd_body_lines!r}"
+        )
+
 
 class TestApprovalCallbackThreadLocalWiring:
     """Regression guard for the thread-local callback freeze (#13617 / #13618).

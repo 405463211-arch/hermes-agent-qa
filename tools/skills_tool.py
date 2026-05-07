@@ -879,7 +879,9 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                         },
                         ensure_ascii=False,
                     )
-                return _serve_plugin_skill(plugin_skill_md, namespace, bare)
+                _result_json = _serve_plugin_skill(plugin_skill_md, namespace, bare)
+                _record_view_if_successful(_result_json, name)
+                return _result_json
 
             # Plugin exists but this specific skill is missing?
             available = pm.list_plugin_skills(namespace)
@@ -1334,10 +1336,36 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
+        # Track usage so build_skills_system_prompt can rank by relevance
+        # in the next session's index.  Best-effort — never raises.
+        try:
+            from agent.skill_usage import record_skill_load
+            # Use the resolved skill name (frontmatter > requested name)
+            record_skill_load(skill_name or name)
+        except Exception:
+            pass
+
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as e:
         return tool_error(str(e), success=False)
+
+
+def _record_view_if_successful(result_json: str, requested_name: str) -> None:
+    """Bump usage counters when a skill_view result indicates success.
+
+    Used at plugin-skill return sites where we don't have the resolved
+    skill name in scope yet — parsing the JSON we're about to return is
+    the cleanest hook.  Best-effort.
+    """
+    try:
+        from agent.skill_usage import record_skill_load
+        result = json.loads(result_json)
+        if isinstance(result, dict) and result.get("success") is True:
+            resolved = result.get("name") or requested_name
+            record_skill_load(resolved)
+    except Exception:
+        pass
 
 
 

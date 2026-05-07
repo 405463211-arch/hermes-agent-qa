@@ -39,11 +39,22 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 class TestGuidanceConstants:
     def test_memory_guidance_discourages_task_logs(self):
-        assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
         assert "session_search" in MEMORY_GUIDANCE
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
+
+    def test_memory_guidance_explains_three_target_layering(self):
+        # Behavior contract: the guidance must teach the model when to use
+        # rules vs user vs memory, not just describe one bucket.
+        assert "rules" in MEMORY_GUIDANCE
+        assert "user" in MEMORY_GUIDANCE
+        assert "memory" in MEMORY_GUIDANCE
+        # Imperative phrasing should be steered to rules, not memory —
+        # this is the change that prevents the GLM "everything in memory"
+        # failure mode.
+        lowered = MEMORY_GUIDANCE.lower()
+        assert "imperative" in lowered or "always" in lowered
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE

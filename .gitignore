@@ -69,3 +69,6 @@ mini-swe-agent/
 .nix-stamps/
 result
 website/static/api/skills-index.json
+
+# Local-only docs (privacy: home deploy plans, work-in-progress notes, local paths)
+.cursor/docs/

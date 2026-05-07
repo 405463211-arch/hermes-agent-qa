@@ -2205,6 +2205,21 @@ class HermesCLI:
         }
 
         if not agent:
+            # No agent yet, but if the user has configured a non-default
+            # context engine (e.g. LCM) we still want the status bar to
+            # surface that — otherwise users see "🧬lcm" disappear before
+            # they send the first message and assume LCM isn't wired.
+            # Cheap: just read the config dict (already loaded for the CLI).
+            try:
+                cfg = getattr(self, "config", None) or {}
+                engine_name = (
+                    (cfg.get("context") or {}).get("engine") or "compressor"
+                )
+                if engine_name and engine_name != "compressor":
+                    snapshot["engine_name"] = engine_name
+                    snapshot["lcm_chunks"] = None  # unknown until agent inits
+            except Exception:
+                pass
             return snapshot
 
         snapshot["session_input_tokens"] = getattr(agent, "session_input_tokens", 0) or 0
@@ -2225,6 +2240,24 @@ class HermesCLI:
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
+
+            # Surface the active context engine + LCM chunk count so the
+            # status bar can show a live "🧬 lcm:N" badge.  Without this
+            # users had no way to tell whether LCM was actually wired vs.
+            # the default summarising compressor — both are invisible until
+            # they fire, but only LCM is opt-in.
+            try:
+                engine_name = getattr(compressor, "name", "") or ""
+                snapshot["engine_name"] = engine_name
+                if engine_name and engine_name != "compressor":
+                    get_status = getattr(compressor, "get_status", None)
+                    if callable(get_status):
+                        es = get_status() or {}
+                        chunks = es.get("lcm_indexed_chunks")
+                        if isinstance(chunks, int) and chunks >= 0:
+                            snapshot["lcm_chunks"] = chunks
+            except Exception:
+                pass
 
         return snapshot
 
@@ -2380,6 +2413,11 @@ class HermesCLI:
 
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
             parts.append(duration_label)
+            engine_name = snapshot.get("engine_name") or ""
+            if engine_name and engine_name != "compressor":
+                chunks = snapshot.get("lcm_chunks")
+                chunk_str = f":{chunks}" if isinstance(chunks, int) else ":?"
+                parts.append(f"🧬{engine_name}{chunk_str}")
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
                 parts.append(prompt_elapsed)
@@ -2442,6 +2480,25 @@ class HermesCLI:
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                     ]
+                    # LCM badge — opt-in context engine that's otherwise
+                    # invisible until it fires.  Showing "🧬 lcm:N" with the
+                    # live chunk count lets users see at a glance that the
+                    # engine is wired and how much it has stashed this
+                    # session.  Skipped for the default compressor so the
+                    # bar stays clean for non-LCM users.  Renders before
+                    # the agent is initialised too (chunks=None → "?")
+                    # so users can confirm LCM is wired from /lcm status
+                    # alone, without sending a chat message first.
+                    engine_name = snapshot.get("engine_name") or ""
+                    if engine_name and engine_name != "compressor":
+                        chunks = snapshot.get("lcm_chunks")
+                        chunk_str = (
+                            f":{chunks}" if isinstance(chunks, int) else ":?"
+                        )
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(
+                            ("class:status-bar-strong", f"🧬{engine_name}{chunk_str}")
+                        )
                     # Position 7: per-prompt elapsed timer (live or frozen)
                     prompt_elapsed = snapshot.get("prompt_elapsed")
                     if prompt_elapsed:
@@ -6072,6 +6129,8 @@ class HermesCLI:
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "context":
+            self._show_context(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -6163,8 +6222,16 @@ class HermesCLI:
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "skin":
             self._handle_skin_command(cmd_original)
+        elif canonical == "lcm":
+            self._handle_lcm_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
+        elif canonical == "rules":
+            self._handle_rules_command(cmd_original)
+        elif canonical == "memory":
+            self._handle_memory_command(cmd_original)
+        elif canonical == "learn":
+            self._handle_learn_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -6811,6 +6878,214 @@ class HermesCLI:
         if self._apply_tui_skin_style():
             print("  Prompt + TUI colors updated.")
 
+    def _handle_lcm_command(self, cmd: str):
+        """Handle ``/lcm [status|embedder|clear]`` — inspect the LCM context engine."""
+        engine = getattr(self.agent, "context_compressor", None) if self.agent else None
+        agent_ready = self.agent is not None and engine is not None
+        is_lcm = engine is not None and getattr(engine, "name", "") == "lcm"
+
+        parts = cmd.strip().split(maxsplit=1)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "status")
+
+        # Fast path: if the agent is fully initialised but is NOT using LCM,
+        # tell the user how to enable it and bail out.
+        if agent_ready and not is_lcm:
+            print("  ✗ LCM 引擎未启用。")
+            print("  当前的上下文引擎：", getattr(engine, "name", "compressor"))
+            print(f"  开启方法：在 {display_hermes_home()}/config.yaml 里加：")
+            print("    context:\n      engine: lcm")
+            return
+
+        # Slow path: agent hasn't been created yet (first command before any
+        # chat message). We can still show the configured state by loading
+        # the LCM engine ad-hoc — same code path the agent would take.
+        if not agent_ready:
+            try:
+                from hermes_cli.config import load_config as _load_cfg
+                _cfg = _load_cfg() or {}
+                _ctx = _cfg.get("context", {}) if isinstance(_cfg, dict) else {}
+                _engine_name = _ctx.get("engine", "compressor") or "compressor"
+            except Exception:
+                _engine_name = "compressor"
+            if _engine_name != "lcm":
+                print("  ✗ LCM 引擎未启用。")
+                print(f"  当前的上下文引擎：{_engine_name}")
+                print(f"  开启方法：在 {display_hermes_home()}/config.yaml 里加：")
+                print("    context:\n      engine: lcm")
+                return
+            try:
+                from plugins.context_engine import load_context_engine
+                engine = load_context_engine("lcm")
+            except Exception as e:
+                print(f"  ✗ LCM 已配置但加载失败：{e}")
+                return
+            if engine is None:
+                print("  ✗ LCM 已配置但插件加载失败。")
+                print(f"  详情请看 {display_hermes_home()}/logs/agent.log。")
+                return
+            # Populate context_length / threshold_tokens on the ad-hoc engine
+            # so /lcm status doesn't show the misleading "(~0/0 tok)".  The
+            # real agent runs update_model() during init, but the ad-hoc
+            # engine never gets that call.  We do the same lookup here from
+            # config + model metadata.
+            try:
+                from agent.model_metadata import get_model_context_length
+                _model_for_ctx = self.model or "unknown"
+                _ctx_len = get_model_context_length(
+                    _model_for_ctx,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    provider=getattr(self, "provider", None),
+                )
+                if _ctx_len:
+                    engine.update_model(
+                        _model_for_ctx, _ctx_len,
+                        base_url=self.base_url or "",
+                        api_key=self.api_key or "",
+                        provider=getattr(self, "provider", "") or "",
+                    )
+            except Exception:
+                pass
+            is_lcm = True
+            print(f"  {_DIM}（以下是配置状态 —— agent 要等你发第一条消息才会真正创建）{_RST}")
+
+        if sub in ("status", ""):
+            try:
+                emb = engine.get_embedder_info()
+                size = engine.get_db_size_bytes()
+                size_kb = size / 1024.0
+                size_str = (
+                    f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.2f} MB"
+                )
+                session_chunks = engine.get_session_chunks()
+                total_chunks = engine.get_total_chunks()
+                threshold_pct = int(getattr(engine, "threshold_percent", 0.75) * 100)
+                threshold_tok = int(getattr(engine, "threshold_tokens", 0) or 0)
+                ctx_len = int(getattr(engine, "context_length", 0) or 0)
+
+                # Highlight when the user's chosen embedder actually
+                # got loaded vs. fell back through tier 1→2→3.  The
+                # configured_model field carries what config.yaml
+                # asked for; "model" is what the live embedder ended
+                # up loading.  Mismatch = silent fallback worth
+                # surfacing to the user.
+                _backend = emb.get("name") or "unknown"
+                _model = emb.get("model") or "?"
+                _dim = emb.get("dim", 0)
+                _device = emb.get("device") or "auto"
+                _configured = emb.get("configured_model")
+
+                print()
+                print("  ╭─ LCM 长上下文记忆 ─────────────────────────────╮")
+                print(f"  │ 引擎：             lcm  ●（已激活）")
+                print(f"  │ 向量后端：         {_backend}")
+                print(f"  │ 嵌入模型：         {_model}（维度 {_dim}）")
+                print(f"  │ 运行设备：         {_device}")
+                if _configured and _configured != _model and _backend == "sentence-transformers":
+                    print(f"  │ ⚠ 配置的是 {_configured}，实际加载了 {_model}")
+                elif _configured and _backend != "sentence-transformers":
+                    print(
+                        f"  │ ⚠ 配置的本地模型 {_configured} 未启用，"
+                        f"已回落到 {_backend} —— 详见 /lcm embedder"
+                    )
+                print(f"  │ 触发阈值：         {threshold_pct}% 的上下文 "
+                      f"(~{threshold_tok:,}/{ctx_len:,} tok)")
+                # Live progress vs. trigger — only meaningful once the
+                # agent has done at least one API call (last_prompt_tokens
+                # is populated from real provider usage).  Shows:
+                #   - current ctx usage
+                #   - tokens remaining until LCM fires
+                #   - how many times it has fired this session
+                if agent_ready:
+                    cur_tok = int(getattr(engine, "last_prompt_tokens", 0) or 0)
+                    cur_pct = (
+                        round(cur_tok / ctx_len * 100) if ctx_len else 0
+                    )
+                    if cur_tok > 0:
+                        print(
+                            f"  │ 当前已用：         {cur_tok:,} tok（{cur_pct}%）"
+                        )
+                        if threshold_tok and cur_tok < threshold_tok:
+                            remaining = threshold_tok - cur_tok
+                            gap_pct = max(1, threshold_pct - cur_pct)
+                            print(
+                                f"  │ 距离下次触发：     还差 ~{remaining:,} tok"
+                                f"（{gap_pct}%）—— 待机中"
+                            )
+                        elif threshold_tok and cur_tok >= threshold_tok:
+                            print(
+                                f"  │ 距离下次触发：     已达阈值 —— 下一轮即触发"
+                            )
+                    cc = int(getattr(engine, "compression_count", 0) or 0)
+                    print(f"  │ 本次会话已触发：   {cc} 次")
+                print(f"  │ 已索引（本会话）： {session_chunks} 个 chunk")
+                print(f"  │ 已索引（所有会话）：{total_chunks} 个 chunk")
+                print(f"  │ 数据库路径：       {engine.get_db_path()}")
+                print(f"  │ 数据库大小：       {size_str}")
+                print("  ╰────────────────────────────────────────────────╯")
+                print("  agent 可调用的工具：lcm_search（语义搜索）、lcm_recall（取回原文）")
+                print("  其它子命令：/lcm embedder（查嵌入模型）| /lcm clear（清空本会话索引）")
+
+                # Friendly hint when DB looks empty even though the user
+                # remembers prior compressions — most common cause is
+                # "compression happened before LCM was configured", which
+                # is silent otherwise and confuses users on /resume.
+                if total_chunks == 0:
+                    print()
+                    print(f"  {_DIM}提示：之前看到的「压缩」如果发生在你启用 LCM 之前，{_RST}")
+                    print(f"  {_DIM}      走的是默认 summarizer，不会写进 LCM 库 —— 所以这里是 0。{_RST}")
+                    print(f"  {_DIM}      新启动后，下次上下文达到阈值时 LCM 才会真正写第一批 chunk。{_RST}")
+                print()
+            except Exception as e:
+                print(f"  ✗ /lcm status 执行失败：{e}")
+            return
+
+        if sub == "embedder":
+            try:
+                emb = engine.get_embedder_info()
+                tier_map = {
+                    "sentence-transformers": "第 1 级（本地推理，最快、零网络）",
+                    "siliconflow": "第 2 级（硅基流动云 API，免费但有 100-300ms 延迟）",
+                    "lexical-hash": "第 3 级（词频 hash 兜底，质量很差，仅保底可用）",
+                }
+                tier = tier_map.get(emb.get("name", ""), "未知")
+                print()
+                print(f"  当前嵌入引擎：{emb.get('name')}（维度 {emb.get('dim')}）")
+                print(f"  所处层级：    {tier}")
+                if emb.get("name") != "sentence-transformers":
+                    print()
+                    print("  升级到本地模型（质量最高、完全离线）：")
+                    print("    pip install sentence-transformers")
+                    print("    # 然后在 config.yaml 里：")
+                    print("    #   context:\n    #     engine: lcm\n    #     lcm:\n    #       embedder_model: BAAI/bge-m3")
+                    print("    # （未设置时默认用 all-MiniLM-L6-v2）")
+                print()
+            except Exception as e:
+                print(f"  ✗ /lcm embedder 执行失败：{e}")
+            return
+
+        if sub == "clear":
+            try:
+                count = engine.get_session_chunks()
+                if count <= 0:
+                    print("  本会话还没有索引任何 chunk，没什么可清。")
+                    return
+                # Simple inline confirm — patterned after /snapshot prune
+                print(f"  即将删除当前会话的 {count} 个 chunk。")
+                print("  这不会影响其它会话，也不会动你看到的对话历史。")
+                resp = input("  确认删除？[y/N] ").strip().lower()
+                if resp != "y":
+                    print("  已取消。")
+                    return
+                deleted = engine.clear_current_session()
+                print(f"  ✓ 已清空 {deleted} 个 chunk。")
+            except Exception as e:
+                print(f"  ✗ /lcm clear 执行失败：{e}")
+            return
+
+        print(f"  未知的 /lcm 子命令：{sub}")
+        print("  用法：/lcm [status|embedder|clear]")
+
     def _toggle_verbose(self):
         """Cycle tool progress mode: off → new → all → verbose → off."""
         cycle = ["off", "new", "all", "verbose"]
@@ -7158,6 +7433,167 @@ class HermesCLI:
             logging.getLogger().setLevel(logging.INFO)
             for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
+    def _show_context(self, command: str = "/context"):
+        """Visualize per-category context-window usage.
+
+        Renders a grid of colored cells (each cell ~ context_length / 400
+        tokens) plus a legend showing how many tokens each bucket
+        (system prompt, tool schemas, MCP, custom agents, memory,
+        skills, messages, free space, autocompact buffer) is consuming.
+
+        Pass ``--json`` to dump the raw breakdown for scripts/tests.
+        """
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        from agent.context_breakdown import (
+            CATEGORY_ORDER,
+            compute_context_breakdown,
+            format_percent,
+            format_token_count,
+            to_json,
+        )
+
+        breakdown = compute_context_breakdown(self.agent, self.conversation_history)
+
+        # ── --json mode ──────────────────────────────────────────────
+        if "--json" in command.split():
+            print(to_json(breakdown))
+            return
+
+        if breakdown.context_length <= 0:
+            print("(._.) Context window size is unknown for this model.")
+            return
+
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+
+        # CJK 字符在终端占 2 列宽度，f"{x:<N}" 按字符数对齐会让双语 label 错位。
+        # 这里用简单的"按显示列宽左对齐"工具兜住中文（CJK 范围按 2 列计算）。
+        def _visual_width(s: str) -> int:
+            return sum(2 if "\u2e80" <= ch <= "\u9fff" else 1 for ch in s)
+
+        def _visual_ljust(s: str, width: int) -> str:
+            pad = max(0, width - _visual_width(s))
+            return s + " " * pad
+
+        # ── Grid layout ──────────────────────────────────────────────
+        # The grid is rendered alongside the legend in a 2-column table.
+        # Reserve ~56 cols for the bilingual legend ("■ Autocompact buffer 压缩
+        # 缓冲区: 33.0k (3.3%)" plus padding) and give the rest to the grid.
+        # 每个 cell 之间补 1 空格,效果更接近"颗粒分明"的方块阵(对标 Claude Code
+        # /context),所以单个 cell 占 2 列显示宽度(末位 cell 不补空格)。
+        # Each grid cell represents context_length / (cols × rows) tokens.
+        try:
+            term_width = self.console.size.width
+        except Exception:
+            term_width = 80
+        grid_cols = max(8, min(20, (term_width - 60) // 2))
+        grid_rows = 10
+        total_cells = grid_cols * grid_rows
+        ctx_len = breakdown.context_length
+
+        per_cell_color = ["grey50"] * total_cells
+        per_cell_glyph = ["·"] * total_cells
+        offset = 0
+        for key in CATEGORY_ORDER:
+            cat = breakdown.category(key)
+            if cat is None or cat.tokens <= 0:
+                continue
+            cells = round(cat.tokens * total_cells / ctx_len)
+            if cells <= 0:
+                cells = 1
+            glyph = "·" if key == "free_space" else (
+                "✕" if key == "autocompact_buffer" else "■"
+            )
+            color = cat.color or "white"
+            for _ in range(cells):
+                if offset >= total_cells:
+                    break
+                per_cell_color[offset] = color
+                per_cell_glyph[offset] = glyph
+                offset += 1
+
+        grid_text = Text()
+        for row_idx in range(grid_rows):
+            for col_idx in range(grid_cols):
+                i = row_idx * grid_cols + col_idx
+                grid_text.append(per_cell_glyph[i], style=per_cell_color[i])
+                if col_idx < grid_cols - 1:
+                    grid_text.append(" ")
+            if row_idx < grid_rows - 1:
+                grid_text.append("\n")
+
+        # ── Legend ───────────────────────────────────────────────────
+        used = breakdown.used_tokens
+        used_pct = (used / ctx_len * 100.0) if ctx_len else 0.0
+
+        legend = Text()
+        # Header: model + total
+        legend.append(f"{breakdown.model or '(unknown model)'}\n", style="bold white")
+        legend.append(
+            f"{format_token_count(used)}/{format_token_count(ctx_len)} tokens "
+            f"({format_percent(used_pct)})\n",
+            style="bold",
+        )
+        legend.append("\n")
+        legend.append("Estimated usage by category\n", style="italic dim")
+
+        for key in CATEGORY_ORDER:
+            cat = breakdown.category(key)
+            if cat is None:
+                continue
+            # Skip empty categories EXCEPT free_space and autocompact_buffer,
+            # which always carry meaning when the window is sized.
+            if cat.tokens == 0 and key not in ("free_space", "autocompact_buffer"):
+                continue
+            # Skip autocompact buffer when compression is disabled.
+            if key == "autocompact_buffer" and not breakdown.compression_enabled:
+                continue
+            marker = "·" if key == "free_space" else (
+                "✕" if key == "autocompact_buffer" else "■"
+            )
+            legend.append(f" {marker} ", style=cat.color)
+            label_text = f"{cat.label} {cat.label_zh}" if cat.label_zh else cat.label
+            label_padded = _visual_ljust(f"{label_text}:", 32)
+            legend.append(label_padded, style="white")
+            legend.append(
+                f"{format_token_count(cat.tokens):>6} "
+                f"({format_percent(cat.percent_of(ctx_len))})\n",
+                style="white",
+            )
+
+        # Note when last_prompt_tokens diverges meaningfully from estimate.
+        if breakdown.last_prompt_tokens > 0:
+            est = breakdown.estimated_total_tokens
+            actual = breakdown.last_prompt_tokens
+            if est > 0:
+                drift = abs(est - actual) / max(actual, 1) * 100.0
+                if drift >= 15.0:
+                    legend.append(
+                        f"\n  Note: estimate differs from provider count by "
+                        f"{drift:.0f}% (provider-reported is shown above).\n",
+                        style="dim",
+                    )
+
+        # ── Compose two-column layout in a Panel ─────────────────────
+        layout = Table.grid(expand=True, padding=(0, 3))
+        layout.add_column(no_wrap=True, width=grid_cols * 2 - 1)
+        layout.add_column(no_wrap=False, ratio=1)
+        layout.add_row(grid_text, legend)
+
+        self._console_print(
+            Panel(
+                layout,
+                title="[bold]Context Usage[/]",
+                title_align="left",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""
@@ -7711,6 +8147,546 @@ class HermesCLI:
         finally:
             self._voice_tts_done.set()
 
+    # ------------------------------------------------------------------
+    # /rules and /memory — agent rules + memory inspection / editing
+    # ------------------------------------------------------------------
+
+    def _ensure_memory_store(self):
+        """Return a live MemoryStore, creating an ad-hoc one if no agent exists yet.
+
+        Returns ``(store, ad_hoc)`` where ``ad_hoc`` is True when we built a
+        fresh store off disk (no live agent in this CLI session yet).  The
+        ad-hoc store is fine for read/write operations — it talks to the
+        same files the agent will pick up on its next session start.
+        """
+        store = getattr(self.agent, "_memory_store", None) if self.agent else None
+        if store is not None:
+            return store, False
+        try:
+            from tools.memory_tool import MemoryStore
+            from hermes_cli.config import load_config as _load_cfg
+            mem_cfg = (_load_cfg() or {}).get("memory", {}) or {}
+            ad_hoc = MemoryStore(
+                memory_char_limit=int(mem_cfg.get("memory_char_limit", 2200)),
+                user_char_limit=int(mem_cfg.get("user_char_limit", 1375)),
+                rules_char_limit=int(mem_cfg.get("rules_char_limit", 4000)),
+                auto_archive_rules=bool(mem_cfg.get("auto_archive_rules", True)),
+                auto_archive_capacity_threshold=float(
+                    mem_cfg.get("auto_archive_capacity_threshold", 0.80)
+                ),
+                auto_archive_age_days=int(mem_cfg.get("auto_archive_age_days", 90)),
+                auto_archive_recurrence_window=int(
+                    mem_cfg.get("auto_archive_recurrence_window", 30)
+                ),
+                trial_new_marker_days=int(mem_cfg.get("trial_new_marker_days", 7)),
+            )
+            ad_hoc.load_from_disk()
+            return ad_hoc, True
+        except Exception as e:
+            logger.debug("Could not build ad-hoc MemoryStore: %s", e)
+            return None, False
+
+    def _show_pending_archive_notice(self) -> None:
+        """Print the auto-archive notification (if any) to the welcome area.
+
+        The notice is consumed via ``MemoryStore.consume_archive_notice()`` so
+        it shows exactly once per session.  Respects
+        ``memory.archive_notify`` — when set to false the notification is
+        suppressed (the archive itself still happens).
+        """
+        store = getattr(self.agent, "_memory_store", None) if self.agent else None
+        if store is None:
+            return
+        try:
+            from hermes_cli.config import load_config as _load_cfg
+            mem_cfg = (_load_cfg() or {}).get("memory", {}) or {}
+            if not mem_cfg.get("archive_notify", True):
+                # Notification disabled — drop the queued notice silently so
+                # we don't keep replaying it on subsequent boots.
+                store.consume_archive_notice()
+                return
+        except Exception:
+            pass
+
+        notice = store.consume_archive_notice()
+        if not notice:
+            return
+
+        # Group reasons for a tighter human-readable message.
+        from collections import Counter
+        reason_counts = Counter(item.get("reason", "") for item in notice)
+        reason_label = (
+            "(90 days dormant)"
+            if reason_counts.get("age_no_recurrence")
+            and not reason_counts.get("capacity_threshold")
+            else "(capacity protection)"
+            if reason_counts.get("capacity_threshold")
+            and not reason_counts.get("age_no_recurrence")
+            else "(mixed)"
+        )
+
+        try:
+            accent = _accent_hex()
+        except Exception:
+            accent = "#FFD700"
+
+        self._console_print(
+            f"[bold {accent}]📝 Auto-archived {len(notice)} rule"
+            f"{'s' if len(notice) != 1 else ''} {reason_label}:[/]"
+        )
+        for item in notice[:5]:
+            text_preview = (item.get("text") or "").splitlines()[0][:80]
+            self._console_print(f"   • {text_preview}")
+        if len(notice) > 5:
+            self._console_print(f"   ... and {len(notice) - 5} more")
+        self._console_print(
+            f"   [dim]Use [/][bold]/rules archive list[/] [dim]to view, "
+            f"[/][bold]/rules unarchive <id>[/] [dim]to restore.[/]"
+        )
+        self._console_print(
+            f"   [dim]Disable: [/][bold]/config set memory.auto_archive_rules false[/]"
+        )
+
+    def _handle_rules_command(self, command: str):
+        """Handle ``/rules [list|add <text>|remove <substring>|edit|show]``.
+
+        Rules are mandatory protocols — red lines the user wants the agent to
+        always follow.  They live in ``$HERMES_HOME/memories/RULES.md`` and
+        are injected at the very top of every system prompt next to the agent
+        identity.  Changes take effect on the next session (frozen-snapshot
+        pattern, see ``tools/memory_tool.py``).
+        """
+        parts = command.strip().split(maxsplit=2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "show")
+        arg = parts[2].strip() if len(parts) > 2 else ""
+
+        store, ad_hoc = self._ensure_memory_store()
+        if store is None:
+            self._console_print(
+                "[bold red]Memory store unavailable — check ~/.hermes/memories/ permissions[/]"
+            )
+            return
+
+        if sub in ("show", "list", ""):
+            entries = store.rules_entries
+            current = store._char_count("rules")
+            limit = store._char_limit("rules")
+            pct = int((current / limit) * 100) if limit > 0 else 0
+            self._console_print(
+                f"[bold cyan]AGENT RULES[/] [{pct}% — {current:,}/{limit:,} chars] "
+                f"({len(entries)} entries)"
+            )
+            if not entries:
+                self._console_print(
+                    "  [dim](empty — add the first rule with /rules add <text>)[/]"
+                )
+            for i, e in enumerate(entries, 1):
+                preview = e if len(e) <= 200 else e[:197] + "..."
+                self._console_print(f"  [bold]{i}.[/] {preview}")
+            self._console_print(
+                f"  [dim]File: {store._path_for('rules')}[/]"
+            )
+            if ad_hoc:
+                self._console_print(
+                    "  [dim](agent not active yet — changes take effect on next chat session)[/]"
+                )
+            elif self.agent is not None:
+                self._console_print(
+                    "  [dim](changes take effect on next session start; current "
+                    "session keeps the frozen snapshot for prefix-cache stability)[/]"
+                )
+            return
+
+        if sub == "add":
+            if not arg:
+                self._console_print("[bold red]Usage: /rules add <text>[/]")
+                return
+            result = store.add("rules", arg)
+            if result.get("success"):
+                self._console_print(f"  [green]✓[/] Rule added. {result.get('usage', '')}")
+            else:
+                self._console_print(f"  [bold red]✗[/] {result.get('error', 'failed')}")
+            return
+
+        if sub == "remove":
+            if not arg:
+                self._console_print(
+                    "[bold red]Usage: /rules remove <unique substring of the rule>[/]"
+                )
+                return
+            result = store.remove("rules", arg)
+            if result.get("success"):
+                self._console_print(f"  [green]✓[/] Rule removed. {result.get('usage', '')}")
+            else:
+                self._console_print(f"  [bold red]✗[/] {result.get('error', 'failed')}")
+            return
+
+        if sub == "edit":
+            self._open_in_editor(store._path_for("rules"))
+            return
+
+        if sub == "pin":
+            self._handle_rules_pin(store, arg, pin=True)
+            return
+
+        if sub == "unpin":
+            self._handle_rules_pin(store, arg, pin=False)
+            return
+
+        if sub == "archive":
+            self._handle_rules_archive(store, arg)
+            return
+
+        if sub == "unarchive":
+            self._handle_rules_unarchive(store, arg)
+            return
+
+        self._console_print(f"[bold red]Unknown subcommand: {sub}[/]")
+        self._console_print(
+            "  [dim]Try: /rules show | add <text> | remove <substring> | edit | "
+            "pin <id-or-substring> | unpin <id-or-substring> | "
+            "archive list | unarchive <id-or-substring>[/]"
+        )
+
+    def _handle_rules_pin(self, store, identifier: str, *, pin: bool):
+        """Toggle pinned state on a rule by id or substring match."""
+        if not identifier:
+            verb = "pin" if pin else "unpin"
+            self._console_print(f"[bold red]Usage: /rules {verb} <id-or-substring>[/]")
+            return
+
+        from agent.rules_lifecycle import parse_rule_entry, serialize_rule_entry
+
+        identifier_lc = identifier.lower()
+        target_idx = -1
+        parsed_entries = [parse_rule_entry(e) for e in store.rules_entries]
+        for i, entry in enumerate(parsed_entries):
+            if entry.source == identifier or identifier_lc in entry.text.lower():
+                target_idx = i
+                break
+
+        if target_idx < 0:
+            self._console_print(
+                f"[bold red]No rule matches '{identifier}'.[/]"
+            )
+            return
+
+        target = parsed_entries[target_idx]
+        if target.pinned == pin:
+            verb = "pinned" if pin else "unpinned"
+            self._console_print(f"  [dim]Rule already {verb}.[/]")
+            return
+
+        target.pinned = pin
+        store.rules_entries[target_idx] = serialize_rule_entry(target)
+        store.save_to_disk("rules")
+        verb = "Pinned" if pin else "Unpinned"
+        self._console_print(
+            f"  [green]✓[/] {verb}: {target.text[:80]}"
+            + ("…" if len(target.text) > 80 else "")
+        )
+        self._console_print(
+            "  [dim]Takes effect on next session start (frozen snapshot).[/]"
+        )
+
+    def _handle_rules_archive(self, store, arg: str):
+        """``/rules archive list`` — show RULES.archive.md contents."""
+        sub = (arg or "list").strip().lower()
+        if sub != "list":
+            self._console_print(
+                "[bold red]Usage: /rules archive list[/]"
+            )
+            return
+        archived = store.list_archived_rules()
+        if not archived:
+            self._console_print("  [dim](no archived rules)[/]")
+            return
+        self._console_print(
+            f"[bold cyan]Archived Rules[/] ({len(archived)} entries)"
+        )
+        for i, item in enumerate(archived, 1):
+            id_part = item["source"] or f"#{i}"
+            text = item["text"]
+            preview = text if len(text) <= 100 else text[:97] + "..."
+            archived_at = item.get("archived_at") or "?"
+            reason = item.get("reason") or "?"
+            self._console_print(
+                f"  [bold]{i}.[/] [dim]{id_part}[/] · {preview}"
+            )
+            self._console_print(
+                f"     [dim]archived {archived_at} ({reason})[/]"
+            )
+        self._console_print(
+            "  [dim]Restore with: /rules unarchive <id-or-substring>[/]"
+        )
+
+    def _handle_rules_unarchive(self, store, identifier: str):
+        if not identifier:
+            self._console_print(
+                "[bold red]Usage: /rules unarchive <id-or-substring>[/]"
+            )
+            return
+        result = store.unarchive_rule(identifier)
+        if result.get("success"):
+            self._console_print(
+                f"  [green]✓[/] Restored: {result.get('restored', '')[:80]}"
+            )
+            self._console_print(
+                "  [dim]Takes effect on next session start.[/]"
+            )
+        else:
+            self._console_print(
+                f"  [bold red]✗[/] {result.get('error', 'failed')}"
+            )
+
+    def _handle_memory_command(self, command: str):
+        """Handle ``/memory [show|edit-rules|edit-memory|edit-user]``.
+
+        Read-only summary by default; edit subcommands open the underlying
+        markdown file in $EDITOR.  Per-bucket edit avoids the trap of editing
+        one file and forgetting the other two.
+        """
+        parts = command.strip().split(maxsplit=1)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "show")
+
+        store, ad_hoc = self._ensure_memory_store()
+        if store is None:
+            self._console_print(
+                "[bold red]Memory store unavailable — check ~/.hermes/memories/ permissions[/]"
+            )
+            return
+
+        if sub == "edit-rules":
+            self._open_in_editor(store._path_for("rules"))
+            return
+        if sub == "edit-memory":
+            self._open_in_editor(store._path_for("memory"))
+            return
+        if sub == "edit-user":
+            self._open_in_editor(store._path_for("user"))
+            return
+        if sub == "review":
+            self._handle_memory_review(store)
+            return
+
+        # Show all three buckets at a glance
+        self._console_print("[bold cyan]Curated Memory[/]")
+        for target, label in (
+            ("rules", "RULES (守则 / red lines)"),
+            ("memory", "MEMORY (working notes)"),
+            ("user", "USER PROFILE"),
+        ):
+            entries = store._entries_for(target)
+            current = store._char_count(target)
+            limit = store._char_limit(target)
+            pct = int((current / limit) * 100) if limit > 0 else 0
+            colour = "green" if pct < 70 else ("yellow" if pct < 90 else "red")
+            self._console_print(
+                f"  [{colour}]{label}[/]: {len(entries)} entries · "
+                f"{pct}% — {current:,}/{limit:,} chars"
+            )
+            self._console_print(f"    [dim]{store._path_for(target)}[/]")
+        archived = getattr(store, "_archived_this_session", 0)
+        if archived:
+            self._console_print(
+                f"  [dim]LCM archive: {archived} entry/entries auto-archived this session "
+                f"(use lcm_search to recall)[/]"
+            )
+        self._console_print(
+            "  [dim]Edit with: /memory edit-rules | edit-memory | edit-user[/]"
+        )
+        self._console_print(
+            "  [dim]Add programmatically with: /rules add <text>[/]"
+        )
+        self._console_print(
+            "  [dim]Find dormant entries with: /memory review[/]"
+        )
+
+    def _handle_memory_review(self, store):
+        """Surface MEMORY.md entries older than 60 days that carry lifecycle metadata.
+
+        Legacy entries (no metadata) are skipped — we have no created date
+        for them.  This is intentionally read-only; pruning is the user's
+        decision and can be done via /memory edit-memory.
+        """
+        try:
+            stale = store.find_stale_memory_entries(age_days=60)
+        except Exception as exc:
+            self._console_print(f"[bold red]Review failed: {exc}[/]")
+            return
+        if not stale:
+            self._console_print("  [dim](no dormant memory entries — all healthy)[/]")
+            self._console_print(
+                "  [dim]Note: legacy entries without timestamps are not flagged.[/]"
+            )
+            return
+        self._console_print(
+            f"[bold yellow]📅 Dormant memory entries[/] ({len(stale)} >60 days old):"
+        )
+        for i, item in enumerate(stale, 1):
+            preview = item["text"]
+            if len(preview) > 100:
+                preview = preview[:97] + "..."
+            self._console_print(
+                f"  [bold]{i}.[/] [dim]({item['age_days']}d, "
+                f"{item.get('pattern_key') or 'no key'})[/] {preview}"
+            )
+        self._console_print(
+            "  [dim]Decide what to keep with: /memory edit-memory[/]"
+        )
+        self._console_print(
+            "  [dim]To promote a fact to a rule: /rules add <text>[/]"
+        )
+
+    def _handle_learn_command(self, command: str):
+        """Handle ``/learn [list|show <id>|stats|resolve <id>]``.
+
+        Read-only by default; the only mutation is ``resolve`` which marks an
+        entry as fixed.  Promotion is automatic via the ``learning_record``
+        tool — there's deliberately no manual ``/learn promote`` shortcut so
+        the threshold logic stays the single source of truth.
+        """
+        from agent.learning_store import LearningStore
+
+        parts = command.strip().split(maxsplit=2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "list")
+        arg = parts[2].strip() if len(parts) > 2 else ""
+
+        try:
+            store = LearningStore()
+        except Exception as exc:
+            self._console_print(f"[bold red]Could not open learning store: {exc}[/]")
+            return
+
+        try:
+            if sub == "stats":
+                stats = store.stats()
+                self._console_print(
+                    f"[bold cyan]Learning Store[/] · total={stats['total']} "
+                    f"· recent_24h={stats['recent_24h']}"
+                )
+                if stats["by_status"]:
+                    parts = [f"{k}={v}" for k, v in sorted(stats["by_status"].items())]
+                    self._console_print(f"  status: {' · '.join(parts)}")
+                if stats["by_category"]:
+                    parts = [f"{k}={v}" for k, v in sorted(stats["by_category"].items())]
+                    self._console_print(f"  category: {' · '.join(parts)}")
+                self._console_print(
+                    f"  eligible_for_promotion: {stats['eligible_for_promotion']}"
+                )
+                return
+
+            if sub == "show":
+                if not arg:
+                    self._console_print("[bold red]Usage: /learn show <learning-id>[/]")
+                    return
+                row = store.get(arg)
+                if row is None:
+                    self._console_print(f"[bold red]No learning matches '{arg}'.[/]")
+                    return
+                self._console_print(
+                    f"[bold cyan]{row['id']}[/] · {row['category']} · {row['status']} "
+                    f"· priority={row['priority']}"
+                )
+                self._console_print(f"  pattern_key: {row['pattern_key']}")
+                self._console_print(f"  summary:     {row['summary']}")
+                if row.get("details"):
+                    self._console_print(f"  details:     {row['details']}")
+                if row.get("suggested_action"):
+                    self._console_print(
+                        f"  suggested:   {row['suggested_action']}"
+                    )
+                self._console_print(
+                    f"  recurrence:  {row['recurrence_count']} "
+                    f"(distinct tasks: {row['distinct_tasks']})"
+                )
+                if row.get("promoted_to"):
+                    self._console_print(f"  promoted_to: {row['promoted_to']}")
+                return
+
+            if sub == "resolve":
+                if not arg:
+                    self._console_print("[bold red]Usage: /learn resolve <learning-id>[/]")
+                    return
+                result = store.mark_resolved(arg)
+                if result.get("success"):
+                    self._console_print(f"  [green]✓[/] Resolved {arg}")
+                else:
+                    self._console_print(
+                        f"  [bold red]✗[/] {result.get('error', 'failed')}"
+                    )
+                return
+
+            # Default: list
+            rows = store.list(limit=20)
+            if not rows:
+                self._console_print(
+                    "  [dim](no learnings recorded yet — model populates this via "
+                    "the learning_record tool when patterns recur)[/]"
+                )
+                return
+            self._console_print(
+                f"[bold cyan]Learnings[/] (top {len(rows)} by recency):"
+            )
+            for row in rows:
+                badge = (
+                    "[yellow]★[/]"
+                    if row["recurrence_count"] >= 3
+                    else " "
+                )
+                summary = row["summary"]
+                if len(summary) > 80:
+                    summary = summary[:77] + "..."
+                self._console_print(
+                    f"  {badge} [bold]{row['id']}[/] [dim]({row['category']}, "
+                    f"x{row['recurrence_count']}, {row['status']})[/] {summary}"
+                )
+            self._console_print(
+                "  [dim]Inspect: /learn show <id> · stats: /learn stats · "
+                "resolve: /learn resolve <id>[/]"
+            )
+        finally:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+    def _open_in_editor(self, path) -> None:
+        """Open ``path`` in the user's $EDITOR (falls back to vi).
+
+        Creates the file if missing so the user lands in an empty buffer
+        rather than getting an error.  Writes happen directly to the file —
+        the next session start will pick them up via load_from_disk().
+        """
+        import os as _os
+        import shlex
+        import subprocess
+
+        try:
+            from pathlib import Path as _Path
+            p = _Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if not p.exists():
+                p.touch()
+        except OSError as e:
+            self._console_print(f"[bold red]Cannot create {path}: {e}[/]")
+            return
+
+        editor_env = _os.environ.get("VISUAL") or _os.environ.get("EDITOR") or "vi"
+        try:
+            cmd = shlex.split(editor_env) + [str(path)]
+            subprocess.run(cmd, check=False)
+            self._console_print(
+                f"  [dim]Saved. Reload by starting a new chat session "
+                f"(/new) — current session keeps the frozen snapshot.[/]"
+            )
+        except FileNotFoundError:
+            self._console_print(
+                f"[bold red]Editor not found: {editor_env}. Set $EDITOR.[/]"
+            )
+        except Exception as e:
+            self._console_print(f"[bold red]Editor failed: {e}[/]")
+
     def _handle_voice_command(self, command: str):
         """Handle /voice [on|off|tts|status] command."""
         parts = command.strip().split(maxsplit=1)
@@ -8173,7 +9149,23 @@ class HermesCLI:
         # spinner/tool-progress line, status bar, input area, separators, and
         # prompt symbol. Measured at ~6 rows during live PTY approval prompts;
         # budget 6 so we don't overestimate the panel's room.
-        term_rows = shutil.get_terminal_size((100, 24)).lines
+        # Prefer prompt_toolkit's reported rows because shutil.get_terminal_size
+        # returns the full terminal height even when previous output occupies
+        # the upper portion (in non-fullscreen mode the application only gets
+        # the bottom rows). Use get_app_or_none() so the shutil fallback (and
+        # tests that patch it) still apply when no PT app is running — plain
+        # get_app() returns a dummy whose output reports the real terminal
+        # size, defeating the patch.
+        term_rows = None
+        try:
+            from prompt_toolkit.application import get_app_or_none as _pt_get_app_or_none
+            _pt_app = _pt_get_app_or_none()
+            if _pt_app is not None:
+                term_rows = _pt_app.output.get_size().rows
+        except Exception:
+            term_rows = None
+        if term_rows is None:
+            term_rows = shutil.get_terminal_size((100, 24)).lines
         chrome_full = 5
         chrome_tight = 3
         reserved_below = 6
@@ -8189,7 +9181,19 @@ class HermesCLI:
         # If the command itself is too long to leave room for choices (e.g. user
         # hit "view" on a multi-hundred-character command), truncate it so the
         # approve/deny buttons still render. Keep at least 1 row of command.
-        max_cmd_rows = max(1, available - chrome_rows - len(choice_wrapped))
+        #
+        # Hard cap: even on tall terminals, never let the command grow large
+        # enough to push the choices below the visible region. Earlier versions
+        # only used `available - chrome - choices`, but the panel sits inside
+        # an HSplit that has no guarantee of getting `term_rows` worth of
+        # space (the renderer can clip the panel from the bottom when the
+        # combined widget heights overflow the redraw area). A hard cap of
+        # 8 logical lines keeps the panel compact enough that the bottom
+        # border and choice list are always on-screen, while still giving
+        # the user enough context to understand the command.  Users who need
+        # the full text can use `/logs` or `/debug`.
+        hard_cap = 8
+        max_cmd_rows = min(hard_cap, max(1, available - chrome_rows - len(choice_wrapped)))
         if len(cmd_wrapped) > max_cmd_rows:
             keep = max(1, max_cmd_rows - 1) if max_cmd_rows > 1 else 1
             cmd_wrapped = cmd_wrapped[:keep] + ["… (command truncated — use /logs or /debug for full text)"]
@@ -9080,6 +10084,15 @@ class HermesCLI:
                 f"[bold {_accent_hex()}]Activated skills:[/] {skills_label}"
             )
             self._startup_skills_line_shown = True
+
+        # Auto-archive notice (Phase 7) — surface rules that were moved out
+        # of RULES.md during this session's boot. We render once and clear,
+        # so the user sees it but it doesn't repeat on /clear or compression.
+        try:
+            self._show_pending_archive_notice()
+        except Exception:
+            pass  # Notification is informational — never break startup.
+
         self._console_print()
         
         # State for async operation

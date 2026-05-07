@@ -77,6 +77,11 @@ ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
 
+# Where bundled (repo-shipped) plugins live. Exposed as a module-level
+# variable so tests can monkeypatch the discovery root without dropping
+# fake plugins into the real ``<repo>/plugins/`` tree.
+_BUNDLED_PLUGIN_DIR: Path = Path(__file__).resolve().parent.parent / "plugins"
+
 
 def _env_enabled(name: str) -> bool:
     """Return True when an env var is set to a truthy opt-in value."""
@@ -166,6 +171,17 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # When True AND the plugin is bundled (shipped with the repo), the
+    # general loader auto-loads it without requiring ``plugins.enabled``.
+    # Reserved for plugins that are passive observers (no side effects on
+    # tool results, no extra API cost) and need to "just work" out of the
+    # box — e.g. ``self_learning`` which only watches for recurring tool
+    # errors and emits soft system_hints. Users can still disable an
+    # auto-enabled plugin by adding it to ``plugins.disabled`` in config.
+    # Has no effect for ``backend`` (auto-loaded by other rule) or
+    # ``exclusive`` (handled by category discovery) kinds, and is ignored
+    # for non-bundled sources (user/project/entrypoint stay opt-in).
+    auto_enable: bool = False
 
 
 @dataclass
@@ -544,10 +560,9 @@ class PluginManager:
         # ``memory/`` and ``context_engine/`` are skipped at the top level —
         # they have their own discovery systems. Porting those to the
         # category-namespace ``kind: exclusive`` model is a future PR.
-        repo_plugins = Path(__file__).resolve().parent.parent / "plugins"
         manifests.extend(
             self._scan_directory(
-                repo_plugins,
+                _BUNDLED_PLUGIN_DIR,
                 source="bundled",
                 skip_names={"memory", "context_engine"},
             )
@@ -609,6 +624,20 @@ class PluginManager:
             # services calls) is driven by ``<category>.provider`` config,
             # enforced by the tool wrapper.
             if manifest.kind == "backend" and manifest.source == "bundled":
+                self._load_plugin(manifest)
+                continue
+
+            # Bundled standalone plugins that explicitly opt-in via
+            # ``auto_enable: true`` in their manifest also auto-load.
+            # Reserved for passive observers (e.g. self_learning) where
+            # requiring an explicit ``plugins.enabled`` entry would defeat
+            # the purpose of "just works out of the box". Users can still
+            # disable via ``plugins.disabled`` (checked above).
+            if (
+                manifest.kind == "standalone"
+                and manifest.source == "bundled"
+                and manifest.auto_enable
+            ):
                 self._load_plugin(manifest)
                 continue
 
@@ -780,6 +809,11 @@ class PluginManager:
                     except Exception:
                         pass
 
+            auto_enable_raw = data.get("auto_enable", False)
+            auto_enable = bool(auto_enable_raw) if isinstance(
+                auto_enable_raw, (bool, int, str)
+            ) else False
+
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -792,6 +826,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                auto_enable=auto_enable,
             )
         except Exception as exc:
             logger.warning("Failed to parse %s: %s", manifest_file, exc)
@@ -984,9 +1019,18 @@ class PluginManager:
     # -----------------------------------------------------------------------
 
     def list_plugins(self) -> List[Dict[str, Any]]:
-        """Return a list of info dicts for all discovered plugins."""
+        """Return a list of info dicts for all discovered plugins.
+
+        Sorted by display ``name`` (not registry ``key``) so the result
+        ordering matches what the user sees in ``hermes plugins list``.
+        Sorting by ``key`` would leak path prefixes (``image_gen/xai``
+        sorts before ``self_learning`` even though its display name
+        ``xai`` should sort after) — that mismatch broke this contract
+        when the first plugin landed between ``image_gen/*`` and a
+        non-prefixed plugin name in dictionary order.
+        """
         result: List[Dict[str, Any]] = []
-        for key, loaded in sorted(self._plugins.items()):
+        for _key, loaded in self._plugins.items():
             result.append(
                 {
                     "name": loaded.manifest.name,
@@ -1002,6 +1046,7 @@ class PluginManager:
                     "error": loaded.error,
                 }
             )
+        result.sort(key=lambda p: p["name"])
         return result
 
     # -----------------------------------------------------------------------

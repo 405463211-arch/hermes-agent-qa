@@ -8058,6 +8058,126 @@ Examples:
     memory_parser.set_defaults(func=cmd_memory)
 
     # =========================================================================
+    # obsidian command — bridge to the user's Obsidian vault
+    # =========================================================================
+    obsidian_parser = subparsers.add_parser(
+        "obsidian",
+        help="Manage the Obsidian vault bridge",
+        description=(
+            "Connect Hermes to your Obsidian vault so the agent can read your "
+            "notes (via obsidian_search/view) and you can see hermes' rules and "
+            "memory in your familiar editor.\n\n"
+            "All bridge state lives under <vault>/hermes/. Hermes never writes "
+            "outside that subdirectory."
+        ),
+    )
+    obsidian_sub = obsidian_parser.add_subparsers(dest="obsidian_command")
+    obsidian_sub.add_parser("setup", help="Interactive vault configuration wizard")
+    obsidian_sub.add_parser("status", help="Show current bridge state")
+    obsidian_sub.add_parser("export", help="Mirror RULES/MEMORY/USER to vault/hermes/")
+    obsidian_sub.add_parser(
+        "import-rules",
+        help="Pull pending rules from vault/hermes/rules-staging.md into RULES.md",
+    )
+    obsidian_sub.add_parser(
+        "import-notes",
+        help="Slice + embed vault/hermes/ingest/ into the LCM long-context store",
+    )
+    obsidian_sub.add_parser(
+        "sync",
+        help="Run import-rules + export back-to-back",
+    )
+    obsidian_sub.add_parser("off", help="Disable the bridge (keeps vault files)")
+
+    def cmd_obsidian(args):
+        from hermes_cli.obsidian_setup import obsidian_command
+
+        obsidian_command(args)
+
+    obsidian_parser.set_defaults(func=cmd_obsidian)
+
+    # =========================================================================
+    # pk command — project-knowledge utilities (currently: vault import)
+    # =========================================================================
+    pk_parser = subparsers.add_parser(
+        "pk",
+        help="Project-knowledge utilities (vault import, etc.)",
+        description=(
+            "Manage the per-project reference data tree at "
+            "$HERMES_HOME/project-knowledge/<project>/.\n\n"
+            "Currently exposes vault import; in-CLI search/view is via the "
+            "project_knowledge_* tools when chatting with the agent."
+        ),
+    )
+    pk_sub = pk_parser.add_subparsers(dest="pk_command")
+    pk_import = pk_sub.add_parser(
+        "import-from-vault",
+        help="Copy notes from a vault folder into project-knowledge/<project>/",
+    )
+    pk_import.add_argument(
+        "project",
+        help="Project name (used as the project-knowledge subdirectory)",
+    )
+    pk_import.add_argument(
+        "vault_folder",
+        nargs="?",
+        default="",
+        help=(
+            "Vault-relative folder to copy from (defaults to "
+            "vault/hermes/ingest/ when omitted)"
+        ),
+    )
+
+    def cmd_pk(args):
+        sub = getattr(args, "pk_command", None)
+        if sub != "import-from-vault":
+            print("\n  Usage: hermes pk import-from-vault <project> [vault_folder]\n")
+            return
+        from agent import obsidian as ob
+
+        if not ob.is_enabled():
+            print("\n  Obsidian bridge not configured. Run `hermes obsidian setup` first.\n")
+            return
+
+        project = (args.project or "").strip()
+        if not project:
+            print("\n  project name required\n")
+            return
+
+        source_dir = None
+        folder = (args.vault_folder or "").strip()
+        if folder:
+            vault = ob.get_vault_path()
+            if vault is None:
+                print("\n  Vault path not configured.\n")
+                return
+            source_dir = vault / folder
+            if not source_dir.is_dir():
+                print(f"\n  Folder not found: {source_dir}\n")
+                return
+
+        print(
+            f"\n  Importing notes into project-knowledge/{project}/"
+            f" (from {source_dir or '<vault>/hermes/ingest/'})..."
+        )
+        result = ob.import_notes_to_pk(project, source_dir=source_dir)
+        if result.error:
+            print(f"  ✗ {result.error}\n")
+            return
+        for path in result.notes_imported[:20]:
+            print(f"    ✓ {path}")
+        if len(result.notes_imported) > 20:
+            print(f"    ... and {len(result.notes_imported) - 20} more")
+        for skipped in result.rules_skipped[:10]:
+            print(f"    · skipped: {skipped}")
+        print(
+            f"\n  Imported {len(result.notes_imported)} file(s). The agent will "
+            f"see them in the project-knowledge index on next session start.\n"
+        )
+
+    pk_parser.set_defaults(func=cmd_pk)
+
+    # =========================================================================
     # tools command
     # =========================================================================
     tools_parser = subparsers.add_parser(

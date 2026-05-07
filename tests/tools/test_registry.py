@@ -289,39 +289,44 @@ class TestCheckFnExceptionHandling:
 
 
 class TestBuiltinDiscovery:
-    def test_matches_previous_manual_builtin_tool_set(self):
-        expected = {
-            "tools.browser_cdp_tool",
-            "tools.browser_tool",
-            "tools.clarify_tool",
-            "tools.code_execution_tool",
-            "tools.cronjob_tools",
-            "tools.delegate_tool",
-            "tools.discord_tool",
-            "tools.feishu_doc_tool",
-            "tools.feishu_drive_tool",
-            "tools.file_tools",
-            "tools.homeassistant_tool",
-            "tools.image_generation_tool",
-            "tools.memory_tool",
-            "tools.mixture_of_agents_tool",
-            "tools.process_registry",
-            "tools.rl_training_tool",
-            "tools.send_message_tool",
-            "tools.session_search_tool",
-            "tools.skill_manager_tool",
-            "tools.skills_tool",
-            "tools.terminal_tool",
-            "tools.todo_tool",
-            "tools.tts_tool",
-            "tools.vision_tools",
-            "tools.web_tools",
+    def test_discovery_picks_up_known_anchor_tools(self):
+        # Behavior contract: a few load-bearing tools must always be
+        # auto-discovered.  Listing every tool here would be a
+        # change-detector — instead, we anchor on the modules that
+        # downstream code (toolsets.py, run_agent.py) explicitly depends
+        # on.  Adding/removing a peripheral tool no longer breaks this.
+        anchors = {
+            "tools.memory_tool",        # used by run_agent.py's MemoryStore
+            "tools.terminal_tool",      # core toolset
+            "tools.file_tools",         # core toolset
+            "tools.web_tools",          # core toolset
+            "tools.skills_tool",        # skills system
+            "tools.skill_manager_tool", # skills system
+            "tools.todo_tool",          # core toolset
+            "tools.delegate_tool",      # core toolset
         }
 
         with patch("tools.registry.importlib.import_module"):
-            imported = discover_builtin_tools(Path(__file__).resolve().parents[2] / "tools")
+            imported = discover_builtin_tools(
+                Path(__file__).resolve().parents[2] / "tools"
+            )
 
-        assert set(imported) == expected
+        missing = anchors - set(imported)
+        assert not missing, f"Anchor tools missing from discovery: {missing}"
+
+    def test_discovery_returns_only_tool_modules(self):
+        # Invariant: every discovered name must live under the tools/
+        # package and look like a Python module path.  This catches the
+        # bug where a stray import sneaks in without being a real tool.
+        with patch("tools.registry.importlib.import_module"):
+            imported = discover_builtin_tools(
+                Path(__file__).resolve().parents[2] / "tools"
+            )
+        assert imported, "Discovery returned no tools at all"
+        for name in imported:
+            assert name.startswith("tools."), f"Bad module name: {name}"
+            # No empty / dot-only / sub-package names
+            assert "." in name and not name.endswith(".")
 
     def test_imports_only_self_registering_modules(self, tmp_path):
         tools_dir = tmp_path / "tools"

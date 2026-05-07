@@ -96,7 +96,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, build_obsidian_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -1422,10 +1422,12 @@ class AIAgent:
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
 
-        # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+        # Persistent memory (RULES.md + MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
         self._user_profile_enabled = False
+        self._rules_enabled = False
+        self._lcm_archive_on_overflow = False
         self._memory_nudge_interval = 10
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
@@ -1435,15 +1437,90 @@ class AIAgent:
                 mem_config = _agent_cfg.get("memory", {})
                 self._memory_enabled = mem_config.get("memory_enabled", False)
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+                self._rules_enabled = mem_config.get("rules_enabled", True)
+                self._lcm_archive_on_overflow = mem_config.get(
+                    "lcm_archive_on_overflow", True
+                )
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 self._memory_flush_min_turns = int(mem_config.get("flush_min_turns", 6))
-                if self._memory_enabled or self._user_profile_enabled:
+                if (
+                    self._memory_enabled
+                    or self._user_profile_enabled
+                    or self._rules_enabled
+                ):
                     from tools.memory_tool import MemoryStore
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        rules_char_limit=mem_config.get("rules_char_limit", 4000),
+                        # Rules-lifecycle settings — see hermes_cli/config.py
+                        # for the rationale of each default.
+                        auto_archive_rules=mem_config.get(
+                            "auto_archive_rules", True
+                        ),
+                        auto_archive_capacity_threshold=mem_config.get(
+                            "auto_archive_capacity_threshold", 0.80
+                        ),
+                        auto_archive_age_days=mem_config.get(
+                            "auto_archive_age_days", 90
+                        ),
+                        auto_archive_recurrence_window=mem_config.get(
+                            "auto_archive_recurrence_window", 30
+                        ),
+                        trial_new_marker_days=mem_config.get(
+                            "trial_new_marker_days", 7
+                        ),
                     )
                     self._memory_store.load_from_disk()
+                    # Obsidian auto-import — pull rules-staging.md from the
+                    # vault into RULES.md BEFORE the snapshot is captured,
+                    # so newly-staged rules take effect this session.
+                    # Skip-memory and subagent contexts (where _memory_store
+                    # is None) silently bypass.
+                    try:
+                        from agent import obsidian as _ob
+                        from hermes_cli.config import load_config as _load_cfg
+                        _obs_cfg = (_load_cfg() or {}).get("obsidian") or {}
+                        if _obs_cfg.get("enabled") and _obs_cfg.get(
+                            "auto_import_rules_on_start", True
+                        ):
+                            _imp = _ob.import_rules_from_staging(store=self._memory_store)
+                            if _imp.rules_added:
+                                logger.info(
+                                    "obsidian: auto-imported %d staged rule(s)",
+                                    len(_imp.rules_added),
+                                )
+                                # Reload so the snapshot reflects new rules
+                                self._memory_store.load_from_disk()
+                    except Exception as _ob_exc:
+                        logger.debug("obsidian auto-import skipped: %s", _ob_exc)
+                    # Run auto-archive once at boot.  The result lives on the
+                    # store as a one-shot notice; the CLI consumes it via
+                    # consume_archive_notice() and prints to the welcome area.
+                    # Gateway platforms don't push the notice to the user
+                    # (would be intrusive in a chat UI); instead it gets
+                    # logged for ops visibility and the user can query via
+                    # ``/rules archive list``.  Failures are silent — the
+                    # bucket would just stay un-archived for this session.
+                    try:
+                        archived = self._memory_store.run_auto_archive()
+                        if archived:
+                            try:
+                                logger.info(
+                                    "rules-lifecycle: auto-archived %d rule(s) at boot: %s",
+                                    len(archived),
+                                    ", ".join(
+                                        f"{a['source']} ({a['reason']})"
+                                        for a in archived[:8]
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                        # Reload so the snapshot used for the system prompt
+                        # reflects the post-archive state.
+                        self._memory_store.load_from_disk()
+                    except Exception:
+                        pass
             except Exception:
                 pass  # Memory is optional -- don't break agent init
         
@@ -1753,6 +1830,26 @@ class AIAgent:
                     self.valid_tool_names.add(_tname)
                     self._context_engine_tool_names.add(_tname)
 
+        # Bridge LCM ↔ MemoryStore: when the LCM context engine is active and
+        # the user opted into overflow archiving, give MemoryStore a reference
+        # so add() can auto-archive oldest entries instead of failing on
+        # "memory full".  Detected by duck-typing — any context engine that
+        # exposes _ensure_store + _ensure_embedder qualifies (today: LCM).
+        if (
+            self._memory_store is not None
+            and self._lcm_archive_on_overflow
+            and getattr(self, "context_compressor", None) is not None
+            and hasattr(self.context_compressor, "_ensure_store")
+            and hasattr(self.context_compressor, "_ensure_embedder")
+        ):
+            try:
+                self._memory_store.attach_lcm(self.context_compressor)
+                logger.debug(
+                    "MemoryStore attached to LCM engine for overflow archiving"
+                )
+            except Exception:
+                pass
+
         # Notify context engine of session start
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
@@ -1817,6 +1914,42 @@ class AIAgent:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
+
+        # When a non-default context engine is active (e.g. LCM), ALWAYS
+        # surface which engine + embedder is wired — even in quiet_mode
+        # (the default for the CLI).  LCM is opt-in and visually invisible
+        # otherwise: users had no way to confirm the embedder model is
+        # loaded and active without running /lcm status manually.  Printed
+        # here once per agent init keeps the noise low while restoring
+        # observability.
+        try:
+            _engine_name = getattr(self.context_compressor, "name", None)
+            if _engine_name and _engine_name != "compressor":
+                _lcm_model = getattr(self.context_compressor, "_embedder_model", None)
+                _lcm_device = getattr(self.context_compressor, "_embedder_device", None) or "auto"
+                _lcm_db = getattr(self.context_compressor, "get_db_path", lambda: None)()
+                _trigger_pct = (
+                    int(self.context_compressor.threshold_percent * 100)
+                    if getattr(self.context_compressor, "threshold_percent", None)
+                    else None
+                )
+                _trigger_tok = getattr(self.context_compressor, "threshold_tokens", 0) or 0
+                bits = [f"engine={_engine_name}"]
+                if _lcm_model:
+                    bits.append(f"embedder={_lcm_model}")
+                    bits.append(f"device={_lcm_device}")
+                trigger_str = ""
+                if _trigger_tok:
+                    if _trigger_pct:
+                        trigger_str = f" — fires at {_trigger_pct}% (~{_trigger_tok:,} tok)"
+                    else:
+                        trigger_str = f" — fires at ~{_trigger_tok:,} tok"
+                store_str = f"  ↳ store: {_lcm_db}" if _lcm_db else ""
+                print(f"🧬 Context engine: {' · '.join(bits)}{trigger_str}")
+                if store_str:
+                    print(store_str)
+        except Exception:
+            pass
 
         # Check immediately so CLI users see the warning at startup.
         # Gateway status_callback is not yet wired, so any warning is stored
@@ -3892,6 +4025,35 @@ class AIAgent:
                 )
             except Exception:
                 pass
+
+        # Obsidian auto-export — mirror RULES/MEMORY/USER (and optionally
+        # the learning store) into the user's vault so they can review
+        # the session's state in their familiar editor.  Best-effort;
+        # never blocks shutdown.
+        try:
+            from agent import obsidian as _ob
+            from hermes_cli.config import load_config as _load_cfg
+            _obs_cfg = (_load_cfg() or {}).get("obsidian") or {}
+            if _obs_cfg.get("enabled") and _obs_cfg.get(
+                "auto_export_on_session_end", True
+            ):
+                _result = _ob.export_memory_files()
+                if _result.error:
+                    logger.debug("obsidian export skipped: %s", _result.error)
+                elif _result.files_written:
+                    logger.info(
+                        "obsidian: auto-exported %d memory file(s)",
+                        len(_result.files_written),
+                    )
+                if _obs_cfg.get("export_learnings", False):
+                    _lr = _ob.export_learnings()
+                    if _lr.files_written:
+                        logger.info(
+                            "obsidian: auto-exported %d learning file(s)",
+                            len(_lr.files_written),
+                        )
+        except Exception as _ob_exc:
+            logger.debug("obsidian auto-export failed: %s", _ob_exc)
     
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.
@@ -4083,6 +4245,31 @@ class AIAgent:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
+        # AGENT RULES — mandatory protocols / red lines.  Sits next to identity
+        # so the model treats them as core behavioral directives (not advisory
+        # memory).  Frozen-snapshot pattern keeps the prefix cache stable.
+        #
+        # Two-tier injection (Phase 7): pinned rules go right under the SOUL
+        # identity for maximum salience; regular rules go in the same slot
+        # as before.  Falls back to the legacy single block when the
+        # lifecycle layer can't be loaded for any reason.
+        if self._memory_store and self._rules_enabled:
+            try:
+                tiers = self._memory_store.format_rules_by_tier()
+                if tiers.get("pinned"):
+                    prompt_parts.append(tiers["pinned"])
+                if tiers.get("regular"):
+                    prompt_parts.append(tiers["regular"])
+            except Exception:
+                # Defensive fallback: keep the old behaviour if anything in
+                # the lifecycle layer breaks.
+                try:
+                    rules_block = self._memory_store.format_for_system_prompt("rules")
+                    if rules_block:
+                        prompt_parts.append(rules_block)
+                except Exception:
+                    pass
+
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
         if "memory" in self.valid_tool_names:
@@ -4174,6 +4361,46 @@ class AIAgent:
             skills_prompt = ""
         if skills_prompt:
             prompt_parts.append(skills_prompt)
+
+        # Project Knowledge — inject the per-project reference data index when
+        # the user has the project_knowledge tools loaded AND a project tree
+        # actually exists.  Empty / missing dirs are silently skipped so users
+        # who don't use the feature pay no token cost.
+        if "project_knowledge_search" in self.valid_tool_names:
+            try:
+                from agent.project_knowledge import build_index, render_index_block
+                _pk_cwd = os.getenv("TERMINAL_CWD") or None
+                _orig_cwd = None
+                if _pk_cwd:
+                    _orig_cwd = os.getcwd()
+                    try:
+                        os.chdir(_pk_cwd)
+                    except OSError:
+                        _orig_cwd = None
+                try:
+                    pk_index = build_index()
+                    pk_block = render_index_block(pk_index)
+                finally:
+                    if _orig_cwd:
+                        try:
+                            os.chdir(_orig_cwd)
+                        except OSError:
+                            pass
+                if pk_block:
+                    prompt_parts.append(pk_block)
+            except Exception as e:
+                logger.debug("Project knowledge index build failed: %s", e)
+
+        # Obsidian vault bridge — tiny prompt block that nudges the model to
+        # use obsidian_search/view when the user asks about their notes.
+        # Empty when the bridge is disabled or the tools aren't loaded; in
+        # that case it's a 0-token no-op.
+        try:
+            obsidian_block = build_obsidian_prompt(self.valid_tool_names)
+            if obsidian_block:
+                prompt_parts.append(obsidian_block)
+        except Exception as e:
+            logger.debug("Obsidian prompt build failed: %s", e)
 
         if not self.skip_context_files:
             # Use TERMINAL_CWD for context file discovery when set (gateway
@@ -7283,14 +7510,67 @@ class AIAgent:
             api_msg["reasoning_content"] = normalized_reasoning
             return
 
-        kimi_requires_reasoning = (
+        # Some providers operate in a "thinking mode" where the API
+        # demands that EVERY prior assistant turn echoes its
+        # reasoning_content back — even when the turn produced no
+        # reasoning text (the field must still be present, possibly
+        # empty).  When the field is missing, the provider rejects
+        # the call with::
+        #
+        #     400 - The `reasoning_content` in the thinking mode must
+        #     be passed back to the API.
+        #
+        # Known offenders: Moonshot/Kimi (kimi-coding) and DeepSeek's
+        # thinking-capable models (deepseek-reasoner, deepseek-v4-flash,
+        # deepseek-v4-thinking, etc.) on the official api.deepseek.com
+        # endpoint.  We backfill an empty string whenever the message
+        # has tool_calls or content but the streamer didn't capture
+        # any reasoning — that's enough to make the provider happy.
+        thinking_protocol_required = (
             self.provider in {"kimi-coding", "kimi-coding-cn"}
             or base_url_host_matches(self.base_url, "api.kimi.com")
             or base_url_host_matches(self.base_url, "moonshot.ai")
             or base_url_host_matches(self.base_url, "moonshot.cn")
+            or self._deepseek_thinking_protocol_required()
         )
-        if kimi_requires_reasoning and source_msg.get("tool_calls"):
+        if thinking_protocol_required and (
+            source_msg.get("tool_calls") or source_msg.get("content")
+        ):
             api_msg["reasoning_content"] = ""
+
+    def _deepseek_thinking_protocol_required(self) -> bool:
+        """True iff this agent talks to a DeepSeek thinking-mode model.
+
+        DeepSeek's official API enforces a strict round-trip rule for
+        models that emit ``reasoning_content``: every replayed
+        assistant message MUST include the field, otherwise the next
+        call is rejected with ``400 invalid_request_error``.  This
+        currently covers ``deepseek-reasoner`` and the ``v4`` family
+        (``deepseek-v4-flash``, ``deepseek-v4-thinking``, ...).  The
+        ``deepseek-chat`` (V3) line does NOT use thinking mode and is
+        unaffected — keep it out of the match list.
+        """
+        try:
+            on_deepseek = (
+                self.provider == "deepseek"
+                or base_url_host_matches(self.base_url, "deepseek.com")
+            )
+        except Exception:
+            on_deepseek = False
+        if not on_deepseek:
+            return False
+        model = (self.model or "").lower()
+        if not model:
+            return False
+        # Conservative match: only flag models that obviously belong to
+        # the thinking family.  ``deepseek-chat`` slips through, which
+        # is exactly what we want.
+        return (
+            "reasoner" in model
+            or "thinking" in model
+            or "v4" in model
+            or "r1" in model
+        )
 
     @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
@@ -7528,6 +7808,130 @@ class AIAgent:
             if messages and messages[-1].get("_flush_sentinel") == _sentinel:
                 messages.pop()
 
+    def _compact_with_progress(
+        self,
+        messages: list,
+        system_message: str,
+        *,
+        approx_tokens: int = None,
+        task_id: str = "default",
+        focus_topic: str = None,
+    ) -> tuple:
+        """Run ``_compress_context`` while emitting periodic elapsed-time updates.
+
+        Compression on slow providers (GLM-5.1 via SiliconFlow, DeepSeek-R1,
+        local llama.cpp, etc.) can take 30-90s while two sequential auxiliary
+        LLM calls execute (``flush_memories`` + ``_generate_summary``).
+        Without progress feedback the spinner looks frozen and users assume
+        the agent has hung.  This wrapper prints a status line on the way in,
+        ticks every 10s on a background thread while compression runs, and
+        prints a final ``compacted in Xs`` (or failure) line on the way out.
+
+        Tests that patch ``_compress_context`` continue to observe the inner
+        call — this method is a thin pass-through plus the ticker thread.
+        """
+        start = time.monotonic()
+        approx_str = f"~{approx_tokens:,} tok" if approx_tokens else "size unknown"
+        focus_str = f", focus={focus_topic!r}" if focus_topic else ""
+        self._safe_print(f"  ⟳ compacting context ({approx_str}{focus_str})…")
+
+        stop_event = threading.Event()
+
+        def _ticker() -> None:
+            next_tick = 10.0
+            while not stop_event.wait(timeout=1.0):
+                elapsed = time.monotonic() - start
+                if elapsed >= next_tick:
+                    self._safe_print(
+                        f"  ⟳ still compacting… ({int(elapsed)}s elapsed — "
+                        f"slow providers like GLM/DeepSeek can take 60-90s)"
+                    )
+                    next_tick = float(int(elapsed)) + 10.0
+
+        ticker_thread = threading.Thread(
+            target=_ticker, name="compaction-progress", daemon=True,
+        )
+        ticker_thread.start()
+
+        try:
+            result = self._compress_context(
+                messages, system_message,
+                approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
+            )
+        except BaseException:
+            elapsed = time.monotonic() - start
+            self._safe_print(f"  ✗ compaction failed after {elapsed:.1f}s")
+            raise
+        else:
+            elapsed = time.monotonic() - start
+            try:
+                _new_msgs = result[0] if isinstance(result, tuple) else messages
+                _new_tokens = self.context_compressor.last_prompt_tokens
+                _saved = max(0, (approx_tokens or 0) - (_new_tokens or 0))
+                _saved_str = f", freed ~{_saved:,} tok" if _saved else ""
+                _msg_str = f"{len(messages)}→{len(_new_msgs)} msgs"
+            except Exception:
+                _saved_str = ""
+                _msg_str = "done"
+            # Identify which engine actually ran so the user can tell at a
+            # glance whether traditional summarisation or a retrieval-based
+            # engine (LCM, etc.) handled this turn — important when LCM is
+            # configured but happens to be silent (short sessions, etc.).
+            _engine_tag = ""
+            try:
+                _engine = getattr(self.context_compressor, "name", "") or ""
+                if _engine and _engine != "compressor":
+                    _engine_tag = f" via {_engine}"
+            except Exception:
+                pass
+            self._safe_print(
+                f"  ✓ compacted in {elapsed:.1f}s ({_msg_str}{_saved_str}){_engine_tag}"
+            )
+            # When LCM ran, surface chunk delta so users can verify the
+            # vector store is actually accumulating — `/lcm status` shows the
+            # cumulative count, but seeing a +N here ties it to the turn
+            # that produced it.  Also surface the case where LCM ran but
+            # produced 0 chunks (silent embedder failure / passthrough),
+            # which is the single most confusing failure mode otherwise:
+            # the user sees ``/lcm status`` keep showing 0 while compress
+            # appears to run.  See agent.log for the underlying error.
+            try:
+                _get = getattr(self.context_compressor, "get_status", None)
+                if _engine_tag and callable(_get):
+                    _stat = _get() or {}
+                    _now_chunks = _stat.get("lcm_indexed_chunks")
+                    _prev = getattr(self, "_lcm_last_chunk_count", 0) or 0
+                    if isinstance(_now_chunks, int) and _now_chunks >= 0:
+                        _delta = max(0, _now_chunks - _prev)
+                        if _delta:
+                            self._safe_print(
+                                f"  🧬 LCM: +{_delta} chunk(s) indexed "
+                                f"(session total: {_now_chunks})"
+                            )
+                        elif (
+                            len(messages) > self.context_compressor.protect_first_n
+                                + self.context_compressor.protect_last_n + 1
+                        ):
+                            # LCM was invoked on a long-enough conversation
+                            # but added zero chunks — the embedder almost
+                            # certainly silently failed (MPS OOM, network
+                            # error, etc.) and the engine fell back to
+                            # passthrough.  Surface the hint loudly so the
+                            # user doesn't have to grep agent.log.
+                            self._safe_print(
+                                "  ⚠ LCM: 0 new chunks — embedder likely "
+                                "failed and fell back to passthrough. "
+                                "Check ~/.hermes/logs/agent.log for "
+                                "'LCM embedding failed' / 'LCM init failed'."
+                            )
+                        self._lcm_last_chunk_count = _now_chunks
+            except Exception:
+                pass
+            return result
+        finally:
+            stop_event.set()
+            ticker_thread.join(timeout=2.0)
+
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
@@ -7731,6 +8135,20 @@ class AIAgent:
                 except Exception:
                     pass
             return result
+        elif function_name == "learning_record":
+            # Self-learning loop — needs the live MemoryStore so it can auto-
+            # promote eligible patterns into RULES.md (rules-lifecycle).
+            from tools.learning_tool import learning_record_handler as _lrn_record
+            return _lrn_record(function_args, store=self._memory_store, task_id=effective_task_id)
+        elif function_name == "project_knowledge_promote":
+            # Promotion writes into RULES.md — needs the live MemoryStore.
+            from tools.project_knowledge_tool import project_knowledge_promote as _pk_promote
+            return _pk_promote(
+                rule_text=function_args.get("rule_text", ""),
+                source_relpath=function_args.get("source_relpath", ""),
+                pinned=bool(function_args.get("pinned", False)),
+                store=self._memory_store,
+            )
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
@@ -8254,6 +8672,30 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name == "learning_record":
+                # Self-learning loop — needs the live MemoryStore for auto-promotion.
+                from tools.learning_tool import learning_record_handler as _lrn_record
+                function_result = _lrn_record(
+                    function_args, store=self._memory_store, task_id=task_id
+                )
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(
+                        f"  {_get_cute_tool_message_impl('learning_record', function_args, tool_duration, result=function_result)}"
+                    )
+            elif function_name == "project_knowledge_promote":
+                from tools.project_knowledge_tool import project_knowledge_promote as _pk_promote
+                function_result = _pk_promote(
+                    rule_text=function_args.get("rule_text", ""),
+                    source_relpath=function_args.get("source_relpath", ""),
+                    pinned=bool(function_args.get("pinned", False)),
+                    store=self._memory_store,
+                )
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(
+                        f"  {_get_cute_tool_message_impl('project_knowledge_promote', function_args, tool_duration, result=function_result)}"
+                    )
             elif function_name == "delegate_task":
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
@@ -11368,8 +11810,7 @@ class AIAgent:
                         _real_tokens = estimate_messages_tokens_rough(messages)
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
-                        self._safe_print("  ⟳ compacting context…")
-                        messages, active_system_prompt = self._compress_context(
+                        messages, active_system_prompt = self._compact_with_progress(
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,

@@ -142,23 +142,57 @@ DEFAULT_AGENT_IDENTITY = (
 )
 
 MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Save durable facts using the memory "
-    "tool: user preferences, environment details, tool quirks, and stable conventions. "
-    "Memory is injected into every turn, so keep it compact and focused on facts that "
-    "will still matter later.\n"
-    "Prioritize what reduces future user steering — the most valuable memory is one "
-    "that prevents the user from having to correct or remind you again. "
-    "User preferences and recurring corrections matter more than procedural task details.\n"
-    "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
-    "state to memory; use session_search to recall those from past transcripts. "
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
-    "Write memories as declarative facts, not instructions to yourself. "
-    "'User prefers concise responses' ✓ — 'Always respond concisely' ✗. "
-    "'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. "
-    "Imperative phrasing gets re-read as a directive in later sessions and can "
-    "cause repeated work or override the user's current request. Procedures and "
-    "workflows belong in skills, not memory."
+    "You have persistent memory across sessions, organized in three layered "
+    "stores. Choose the right one — every entry costs every future turn.\n"
+    "  • target='rules'  → mandatory protocols / red lines the user wants "
+    "    enforced ('always X', 'never Y', 'must', '必须', '红线'). "
+    "    Imperative phrasing belongs HERE, not in memory.\n"
+    "  • target='user'   → who the user is — preferences, role, communication "
+    "    style, recurring corrections about you.\n"
+    "  • target='memory' → working notes — environment facts, project "
+    "    conventions, tool quirks, lessons learned. Declarative facts only.\n"
+    "Routing examples:\n"
+    "  'always run tests before pushing' → rules\n"
+    "  'I prefer concise responses' → user\n"
+    "  'project uses pytest with xdist' → memory\n"
+    "\n"
+    "DETECTION TRIGGERS — when these patterns appear, capture immediately "
+    "(don't wait to be asked):\n"
+    "  • User corrections → memory or rules\n"
+    "    - 'No, that's wrong / 不对'\n"
+    "    - 'Actually, it should be... / 其实应该...'\n"
+    "    - 'You're outdated / 这已经过时了'\n"
+    "    - 'Remember this / 记住 / 别再...'\n"
+    "  • User preferences → user\n"
+    "    - 'I am / I prefer / I always... / 我是 / 我喜欢 / 我习惯'\n"
+    "    - 'Don't bother me with... / 别老问我...'\n"
+    "  • Project / tool facts → memory\n"
+    "    - 'This project uses X' / 'this tool needs Y'\n"
+    "    - 'The build command is...'\n"
+    "  • Mandatory protocols → rules\n"
+    "    - 'Always / Never / Must / 必须 / 红线'\n"
+    "    - User repeats the same correction 2-3 times (not a one-off)\n"
+    "\n"
+    "PROMOTION SIGNAL — when to upgrade memory → rules:\n"
+    "  If you find yourself adding a similar memory entry for the 2nd or 3rd "
+    "  time, that's a sign it should become a rule. Promote it via "
+    "  memory(action='add', target='rules', ...) and remove the duplicate "
+    "  memory entries. Recurring observations across sessions are usually "
+    "  underlying rules in disguise.\n"
+    "\n"
+    "Prioritize entries that reduce future user steering — the most valuable "
+    "memory is one that prevents the user from having to correct or remind "
+    "you again.\n"
+    "Do NOT save task progress, session outcomes, completed-work logs, or "
+    "temporary TODO state; use session_search to recall those from past "
+    "transcripts. If you've discovered a multi-step procedure that could be "
+    "useful later, save it as a skill with the skill tool — skills hold "
+    "richer detail and load on demand instead of every turn.\n"
+    "\n"
+    "If a learning_record tool is available, prefer it for transient "
+    "errors / corrections / feature requests — it tracks recurrence and "
+    "auto-promotes patterns to rules once they prove durable, instead of "
+    "polluting memory with unconfirmed entries."
 )
 
 SESSION_SEARCH_GUIDANCE = (
@@ -795,6 +829,39 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        # Compute relevance scores ONCE up front so each category can rank
+        # by (-score, name) — frequently/recently used skills float to the
+        # top within their category, alphabetical as the tiebreaker keeps
+        # the order deterministic for unscored skills (cache stability).
+        # The result is cached by the LRU keyed on tools+toolsets+platform,
+        # so this only runs on cold-path builds and not every turn.
+        skill_scores: dict[str, float] = {}
+        try:
+            from agent.skill_usage import score as _skill_score, get_usage_stats
+            usage_data = get_usage_stats()
+            if usage_data:
+                # Score every skill we know about; absent scores default to 0
+                for items in skills_by_category.values():
+                    for nm, _desc in items:
+                        if nm not in skill_scores:
+                            skill_scores[nm] = _skill_score(nm)
+        except Exception:
+            pass
+
+        # Mark the top-N skills overall (across categories) with a leading
+        # "★" so the model can spot recently/often-used ones at a glance.
+        # 5 is small enough to feel curated, large enough to cover a
+        # typical week of work.
+        _star_n = 5
+        scored_pairs = [(s, n) for n, s in skill_scores.items() if s > 0]
+        starred: set[str] = set()
+        if scored_pairs:
+            scored_pairs.sort(key=lambda x: (-x[0], x[1]))
+            starred = {n for _s, n in scored_pairs[:_star_n]}
+
+        def _sort_key(item: tuple[str, str]) -> tuple[float, str]:
+            return (-skill_scores.get(item[0], 0.0), item[0])
+
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             cat_desc = category_descriptions.get(category, "")
@@ -802,16 +869,17 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
+            # Deduplicate; sort by relevance score then alphabetically
             seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            for name, desc in sorted(skills_by_category[category], key=_sort_key):
                 if name in seen:
                     continue
                 seen.add(name)
+                marker = "★ " if name in starred else ""
                 if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                    index_lines.append(f"    - {marker}{name}: {desc}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"    - {marker}{name}")
 
         result = (
             "## Skills (mandatory)\n"
@@ -845,6 +913,58 @@ def build_skills_system_prompt(
             _SKILLS_PROMPT_CACHE.popitem(last=False)
 
     return result
+
+
+def build_obsidian_prompt(valid_tool_names: "set[str] | None" = None) -> str:
+    """Tiny system-prompt block describing the Obsidian bridge to the model.
+
+    Appears only when (a) the bridge is configured AND (b) the
+    ``obsidian_search`` tool is loaded.  We deliberately keep this small —
+    fewer than ~150 tokens — because every char is paid on every turn.
+    The point of this block is just to *teach the model when to reach for
+    the tools*; the actual content lives in the vault and is pulled on
+    demand.
+
+    Cost estimate: ~125 tokens once enabled, cached for the entire
+    session (matches the cache contract of every other prompt block).
+    """
+    valid_tool_names = valid_tool_names or set()
+    if "obsidian_search" not in valid_tool_names:
+        return ""
+    try:
+        from agent import obsidian as ob
+        if not ob.is_enabled():
+            return ""
+        scope = ob.get_search_scope()
+    except Exception:
+        return ""
+
+    scope_hint = {
+        "hermes_subdir": (
+            "limited to vault/hermes/ — the user's private notes are NOT visible"
+        ),
+        "ingest": (
+            "limited to vault/hermes/ingest/ — only files the user "
+            "explicitly placed there are visible"
+        ),
+        "all": (
+            "covers the entire vault including the user's personal notes"
+        ),
+    }.get(scope, "limited to vault/hermes/")
+
+    return (
+        "## Obsidian Vault\n"
+        "The user has connected their Obsidian vault. When they ask about "
+        "things they've \"written down\", \"taken notes on\", \"learned "
+        "before\", or \"my notes / 我笔记里 / 我之前写过\", reach for the "
+        "obsidian_search tool first — the answer is likely sitting in their "
+        "knowledge base. Use obsidian_view to read full files, and "
+        "obsidian_save (writes only to vault/hermes/notes/) to preserve "
+        "session output the user might want later.\n"
+        f"Search scope is currently {scope_hint}. "
+        "Don't burn turns reading every match — search → view the most "
+        "relevant 1–2 hits → answer."
+    )
 
 
 def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -> str:

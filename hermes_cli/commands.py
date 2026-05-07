@@ -43,7 +43,7 @@ class CommandDef:
 
     name: str                          # canonical name without slash: "background"
     description: str                   # human-readable description
-    category: str                      # "Session", "Configuration", etc.
+    category: str                      # one of: "Session", "Configuration", "Tools & Skills", "Info", "Exit"
     aliases: tuple[str, ...] = ()      # alternative names: ("bg",)
     args_hint: str = ""                # argument placeholder: "<prompt>", "[name]"
     subcommands: tuple[str, ...] = ()  # tab-completable subcommands
@@ -155,6 +155,26 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
+    CommandDef("context", "Visualize context window usage broken down by category", "Info",
+               aliases=("ctx",), args_hint="[--json]"),
+    CommandDef("lcm", "LCM (Long Context Memory) status: engine, embedder, indexed chunks", "Info",
+               args_hint="[status|embedder|clear]",
+               subcommands=("status", "embedder", "clear")),
+    CommandDef("rules", "View, add, pin, archive, or restore agent rules (RULES.md)",
+               "Tools & Skills",
+               args_hint="[show|add <text>|remove <sub>|edit|pin <id>|unpin <id>|archive list|unarchive <id>]",
+               subcommands=(
+                   "list", "add", "remove", "edit", "show",
+                   "pin", "unpin", "archive", "unarchive",
+               )),
+    CommandDef("memory", "Show curated memory state (RULES + MEMORY + USER + dormant review)",
+               "Tools & Skills",
+               args_hint="[show|edit-rules|edit-memory|edit-user|review]",
+               subcommands=("show", "edit-rules", "edit-memory", "edit-user", "review")),
+    CommandDef("learn", "Inspect & manage the self-learning store (transient errors, corrections, feature requests)",
+               "Tools & Skills",
+               args_hint="[list|show <id>|stats|resolve <id>]",
+               subcommands=("list", "show", "stats", "resolve")),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",

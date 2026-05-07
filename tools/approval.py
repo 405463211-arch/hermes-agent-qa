@@ -455,24 +455,11 @@ def prompt_dangerous_approval(command: str, description: str,
             print()
             sys.stdout.flush()
 
-            result = {"choice": ""}
-
-            def get_input():
-                try:
-                    prompt = "      Choice [o/s/a/D]: " if allow_permanent else "      Choice [o/s/D]: "
-                    result["choice"] = input(prompt).strip().lower()
-                except (EOFError, OSError):
-                    result["choice"] = ""
-
-            thread = threading.Thread(target=get_input, daemon=True)
-            thread.start()
-            thread.join(timeout=timeout_seconds)
-
-            if thread.is_alive():
+            prompt = "      Choice [o/s/a/D]: " if allow_permanent else "      Choice [o/s/D]: "
+            choice = _read_approval_choice(prompt, timeout_seconds)
+            if choice is None:
                 print("\n      ⏱ Timeout - denying command")
                 return "deny"
-
-            choice = result["choice"]
             if choice in ('o', 'once'):
                 print("      ✓ Allowed once")
                 return "once"
@@ -497,6 +484,109 @@ def prompt_dangerous_approval(command: str, description: str,
             del os.environ["HERMES_SPINNER_PAUSE"]
         print()
         sys.stdout.flush()
+
+
+def _read_approval_choice(prompt: str, timeout_seconds: int) -> "str | None":
+    """Read a single line of approval input with a timeout.
+
+    Returns the lowercased stripped string, or ``None`` on timeout / EOF.
+
+    PRIOR IMPLEMENTATION (the bug we are fixing):
+
+        thread = threading.Thread(target=lambda: input(prompt), daemon=True)
+        thread.start()
+        thread.join(timeout=timeout_seconds)
+        if thread.is_alive(): return "deny"
+
+    The daemon thread above keeps blocking on ``input()`` after the
+    main thread moves on.  ``input()`` reads from ``sys.stdin``,
+    which acquires the BufferedReader's internal lock — and never
+    releases it because the thread is forever waiting on a read that
+    never arrives.  Symptoms:
+
+      * keystrokes silently dropped (the leaked thread races
+        prompt_toolkit for stdin),
+      * ``Fatal Python error: _enter_buffered_busy: could not acquire
+        lock for <_io.BufferedReader name='<stdin>'> at interpreter
+        shutdown, possibly due to daemon threads`` when the user
+        finally pkills hermes.
+
+    The new implementation reads from ``/dev/tty`` (the controlling
+    terminal), NOT from ``sys.stdin``.  That avoids the conflict
+    with prompt_toolkit entirely.  On timeout we close the tty fd
+    explicitly so no thread is left holding any lock.  When
+    ``/dev/tty`` is unavailable (no controlling terminal — pipes,
+    daemons, headless tests) we fall back to a single ``input()``
+    call with NO thread / NO timeout.  Tests that mock ``builtins.input``
+    keep working unchanged because the fallback is the path they hit.
+    """
+    import builtins
+
+    # Only use the /dev/tty path when sys.stdin is a real interactive
+    # terminal.  When it isn't (pytest capture, piped stdin, headless
+    # test harness) fall back to plain input() — that's what the test
+    # suite mocks and what file-redirected stdin expects.
+    use_tty = False
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            use_tty = True
+    except Exception:
+        use_tty = False
+
+    tty_fd = None
+    if use_tty:
+        try:
+            tty_fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+        except OSError:
+            tty_fd = None
+
+    if tty_fd is None:
+        # No controlling terminal — fall back to plain input().
+        # Tests mock builtins.input so they hit this path and just
+        # work.  Real headless callers (gateway, cron) should have a
+        # callback registered and never reach here.
+        try:
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            line = builtins.input()
+            return line.strip().lower()
+        except (EOFError, OSError, KeyboardInterrupt):
+            return None
+
+    try:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        import select as _select
+        deadline = time.monotonic() + max(0, timeout_seconds)
+        buf = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                rlist, _, _ = _select.select([tty_fd], [], [], remaining)
+            except (OSError, ValueError):
+                return None
+            if not rlist:
+                return None
+            try:
+                chunk = os.read(tty_fd, 256)
+            except OSError:
+                return None
+            if not chunk:
+                # EOF
+                if buf:
+                    return buf.decode("utf-8", errors="replace").strip().lower()
+                return None
+            for b in chunk:
+                if b in (0x0a, 0x0d):  # \n or \r
+                    return buf.decode("utf-8", errors="replace").strip().lower()
+                buf.append(b)
+    finally:
+        try:
+            os.close(tty_fd)
+        except OSError:
+            pass
 
 
 def _normalize_approval_mode(mode) -> str:

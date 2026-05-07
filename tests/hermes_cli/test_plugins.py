@@ -318,6 +318,96 @@ class TestPluginLoading:
         assert mgr._plugins["not_memory"].manifest.kind == "standalone"
 
 
+class TestPluginAutoEnable:
+    """Bundled standalone plugins with ``auto_enable: true`` skip opt-in.
+
+    This is the loophole used by ``self_learning`` so the self-improvement
+    loop works out of the box. Verify the four important cases:
+      1. bundled + auto_enable=true     -> auto-loaded, no plugins.enabled needed
+      2. bundled + auto_enable absent   -> opt-in (existing behavior)
+      3. user-installed + auto_enable=true -> opt-in (auto_enable ignored for non-bundled)
+      4. bundled + auto_enable=true + plugins.disabled -> stays disabled
+    """
+
+    def _bundled(self, tmp_path: Path, name: str, *, auto_enable: bool):
+        """Create a fake bundled plugin and patch the bundled scan path."""
+        plugins_dir = tmp_path / "fake_repo_plugins"
+        pdir = plugins_dir / name
+        pdir.mkdir(parents=True)
+        manifest = {"name": name, "version": "0.1.0", "description": "auto-enable test"}
+        if auto_enable:
+            manifest["auto_enable"] = True
+        (pdir / "plugin.yaml").write_text(yaml.dump(manifest))
+        (pdir / "__init__.py").write_text("def register(ctx):\n    pass\n")
+        return plugins_dir
+
+    def test_bundled_auto_enable_loads_without_plugins_enabled(
+        self, tmp_path, monkeypatch
+    ):
+        plugins_dir = self._bundled(tmp_path, "passive_observer", auto_enable=True)
+        # Empty HERMES_HOME so plugins.enabled is unset.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        import hermes_cli.plugins as plmod
+        monkeypatch.setattr(plmod, "_BUNDLED_PLUGIN_DIR", plugins_dir, raising=False)
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        loaded = [k for k, v in mgr._plugins.items() if v.enabled]
+        assert "passive_observer" in loaded, (
+            f"bundled+auto_enable plugin should auto-load; got enabled={loaded}"
+        )
+
+    def test_bundled_no_auto_enable_stays_opt_in(self, tmp_path, monkeypatch):
+        plugins_dir = self._bundled(tmp_path, "regular_standalone", auto_enable=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        import hermes_cli.plugins as plmod
+        monkeypatch.setattr(plmod, "_BUNDLED_PLUGIN_DIR", plugins_dir, raising=False)
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        rec = mgr._plugins.get("regular_standalone")
+        assert rec is not None
+        assert rec.enabled is False
+        assert "not enabled" in (rec.error or "")
+
+    def test_user_installed_auto_enable_ignored(self, tmp_path, monkeypatch):
+        # auto_enable on a user-installed plugin should NOT bypass opt-in.
+        # Only bundled plugins get the auto-enable shortcut.
+        home = tmp_path / "home" / ".hermes"
+        user_plugins = home / "plugins"
+        user_plugins.mkdir(parents=True)
+        pdir = user_plugins / "user_plugin"
+        pdir.mkdir()
+        (pdir / "plugin.yaml").write_text(
+            yaml.dump({"name": "user_plugin", "auto_enable": True})
+        )
+        (pdir / "__init__.py").write_text("def register(ctx):\n    pass\n")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        rec = mgr._plugins.get("user_plugin")
+        assert rec is not None
+        assert rec.enabled is False, (
+            "auto_enable must only apply to bundled plugins; user plugins "
+            "still require explicit plugins.enabled to opt-in"
+        )
+
+    def test_bundled_auto_enable_overridden_by_disabled(self, tmp_path, monkeypatch):
+        plugins_dir = self._bundled(tmp_path, "noisy_observer", auto_enable=True)
+        home = tmp_path / "home" / ".hermes"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            yaml.dump({"plugins": {"disabled": ["noisy_observer"]}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        import hermes_cli.plugins as plmod
+        monkeypatch.setattr(plmod, "_BUNDLED_PLUGIN_DIR", plugins_dir, raising=False)
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        rec = mgr._plugins.get("noisy_observer")
+        assert rec is not None
+        assert rec.enabled is False
+        assert "disabled via config" in (rec.error or "")
+
+
 # ── TestPluginHooks ────────────────────────────────────────────────────────
 
 

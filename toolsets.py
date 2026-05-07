@@ -48,6 +48,13 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Self-learning loop (Pattern-Key dedupe + auto-promotion to RULES.md)
+    "learning_record", "learning_list", "learning_resolve",
+    # Project knowledge (per-project reference data tree)
+    "project_knowledge_search", "project_knowledge_view", "project_knowledge_save",
+    "project_knowledge_promote",
+    # Obsidian vault bridge (gated on obsidian.enabled via check_fn)
+    "obsidian_search", "obsidian_view", "obsidian_save",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -163,8 +170,37 @@ TOOLSETS = {
     },
     
     "memory": {
-        "description": "Persistent memory across sessions (personal notes + user profile)",
+        "description": "Persistent memory across sessions (rules + personal notes + user profile)",
         "tools": ["memory"],
+        "includes": []
+    },
+
+    "learning": {
+        "description": (
+            "Self-learning loop — record errors/corrections/feature requests "
+            "with Pattern-Key dedupe; auto-promote durable patterns to RULES.md"
+        ),
+        "tools": ["learning_record", "learning_list", "learning_resolve"],
+        "includes": []
+    },
+
+    "project_knowledge": {
+        "description": "Per-project reference data tree (~/.hermes/project-knowledge/<project>/) — search, view, save, and promote distilled facts to RULES.md",
+        "tools": [
+            "project_knowledge_search", "project_knowledge_view", "project_knowledge_save",
+            "project_knowledge_promote",
+        ],
+        "includes": []
+    },
+
+    "obsidian": {
+        "description": (
+            "Obsidian vault bridge — search, view, and save notes in the user's "
+            "Obsidian vault. Tools are gated on `obsidian.enabled` config; "
+            "writes are confined to vault/hermes/ so the user's own notes "
+            "are never overwritten."
+        ),
+        "tools": ["obsidian_search", "obsidian_view", "obsidian_save"],
         "includes": []
     },
     
