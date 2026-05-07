@@ -4,14 +4,15 @@
 
 ## 这是什么
 
-**主线三件套**（hermes 调试闭环）+ **独立工作流**（GitHub 同步）+ 一份索引：
+**主线三件套**（hermes 调试闭环）+ **两个独立工作流**（GitHub push / upstream merge）+ 一份索引：
 
 | 文件 | 命令 | 阶段 | 做什么 |
 |---|---|---|---|
 | `sp_brainstorm.md` | `/sp_brainstorm` | 1. 设计 | 苏格拉底式提问 → 多方案 → 架构红线检查 → 落地设计文档 |
 | `sp_plan.md` | `/sp_plan` | 2. 计划 | 把方案拆成 2-5 分钟小任务，每任务带精确路径 + 验证命令 |
 | `sp_execute.md` | `/sp_execute` | 3-7. 执行 | 分批执行 + 检查点 + 双向落盘(plan 状态 + execute 进度) |
-| `sp_sync_github.md` | `/sp_sync_github` | 独立 | 安全把本地工程同步到 GitHub：密钥扫描 / shallow 修复 / fork README 冲突 / commit 身份等 |
+| `sp_sync_github.md` | `/sp_sync_github` | 独立（出站） | 安全把本地工程同步到 GitHub：密钥扫描 / shallow 修复 / fork README 冲突 / commit 身份等 |
+| `sp_sync_upstream_release.md` | `/sp_sync_upstream_release` | 独立（入站） | 安全把上游新发布版（v0.x.0 tag）合并到本地 fork：worktree 隔离 / 防 hermes update 抢资源 / 11 类冲突决策 / 回归测试 |
 | `README.md` | — | 索引 | 全套使用指南（本文件） |
 
 ## 三件套工作流
