@@ -37,7 +37,7 @@
 
 ---
 
-## 执行流程（7 步）
+## 执行流程（8 步）
 
 ### Step 1: 现状诊断
 
@@ -195,8 +195,116 @@ git config user.name "<你想显示的名字>"
 
 ---
 
+### Step 8: 收尾 — 分支清理 + tag/release（push 完成后）
+
+push 完成后通常会留下临时的同步/特性分支（如 `sync/v0.12.0`、`wip-xxx`、`feature/xxx`），合到 `main` 后建议清理；版本节点建议打 tag 让 GitHub 的 Tags / Releases 页有迹可循。
+
+#### 8.1 分支清理（已合并的临时分支）
+
+```bash
+# 1. 看哪些分支已经合到 main（候选删除目标）
+git branch --merged main | grep -v "^\*\| main$"
+
+# 2. 删本地分支（用 -d 不用 -D，未合并会报错保护你）
+git branch -d sync/v0.12.0
+
+# 3. 删远端分支
+git push origin --delete sync/v0.12.0
+# 等价：git push origin :sync/v0.12.0
+
+# 4. 验证只剩需要保留的分支
+git branch -vv
+git ls-remote --heads origin
+```
+
+**注意点**：
+- ✅ 用 `-d`（safe）不用 `-D`（force）：未合并的分支会报错保护你免于丢工作
+- ⚠️ 删除时若 git 报 `error: could not write config file .git/config: Operation not permitted` —— sandbox 限制，分支已成功删除，不影响结果
+- 残留的 tracking 配置可手动清：`git config --unset branch.<name>.remote 2>/dev/null; git config --unset branch.<name>.merge 2>/dev/null`
+- **不要删 main / master / 默认分支** —— GitHub 默认分支删了之后页面会变成空仓库样子，要在 Settings 里改默认分支才能恢复
+
+#### 8.2 打 tag（标记版本节点）
+
+| Tag 类型 | 命令 | 何时用 |
+|---|---|---|
+| **轻量 tag** | `git tag <name>` | 个人临时标记，无 message |
+| **annotated tag**（推荐） | `git tag -a <name> -m "..."` | 正式发布，带作者 / 时间 / 说明 |
+
+```bash
+# 例：给当前 main HEAD 打 v0.12.0 annotated tag
+git tag -a v0.12.0 -m "Sync to upstream NousResearch/hermes-agent v0.12.0 + fork docs"
+
+# 推单个 tag 到 origin
+git push origin v0.12.0
+
+# 推所有本地 tag（小心：会把所有本地 tag 一次性推上去，包括 fetch upstream 时拉来的上游 tag）
+# 不推荐除非确定要这么做
+# git push origin --tags
+```
+
+**tag 指向哪个 commit 的 3 个常见决策**：
+
+| 选项 | 指向 | 含义 | 适用 |
+|---|---|---|---|
+| **A. main HEAD**（最常用） | `git tag v<X.Y.Z>` 默认指向 HEAD | "fork 升级到 v<X.Y.Z> 的最终状态（含本地 docs/特性）" | 90% 的场景 |
+| B. merge commit | `git tag v<X.Y.Z>-merge <merge-sha>` | "纯粹合上游 v<X.Y.Z> 的瞬间，不含 docs" | docs 想单独发 |
+| C. 上游原始 release commit | `git tag v<X.Y.Z>-upstream <upstream-sha>` | "完全等同于上游官方 tag" | 想保留上游精确发布点 |
+
+> **fork 仓库的 v<X.Y.Z> tag 与上游 v<X.Y.Z> tag 不会自动同步冲突** —— tag 不会跨 remote 自动 fetch（除非显式 `git fetch upstream --tags`），所以同名 tag 可放心用。
+
+#### 8.3 创建 GitHub Release（可选 — Releases 页面正式发布记录）
+
+> Release = Tag + 版本说明 + 可选附件。仅在 tag 已 push 后才能创建。
+
+需要先装 [`gh` CLI](https://cli.github.com/) 并登录：
+
+```bash
+gh auth login                              # 首次配置（按提示选 SSH/HTTPS + 浏览器登录）
+gh auth status                             # 验证登录态
+```
+
+创建 release 的 3 种方式（任选一）：
+
+```bash
+# 方式 A：用现有的升级笔记作 release notes（推荐 — 笔记内容已结构化）
+gh release create v0.12.0 \
+    --title "v0.12.0 — sync upstream + fork docs" \
+    --notes-file .cursor/prompts/v0.12.0_upgrade_notes.md
+
+# 方式 B：手写简短 notes
+gh release create v0.12.0 \
+    --title "v0.12.0" \
+    --notes "Sync to upstream NousResearch/hermes-agent v0.12.0; conflicts resolved (11), V3 deepseek-chat regression guard added."
+
+# 方式 C：让 GitHub 自动从 commit 列表生成 notes
+gh release create v0.12.0 --generate-notes
+```
+
+或者完全在 GitHub 网页操作：
+- 打开 https://github.com/<owner>/<repo>/releases/new
+- 选择已 push 的 tag → 填写标题 + 内容 → Publish release
+
+#### 8.4 删除已发布的 tag / release（误操作回滚）
+
+```bash
+# 1. 删本地 tag
+git tag -d v0.12.0
+
+# 2. 删远端 tag
+git push origin --delete v0.12.0
+# 等价：git push origin :refs/tags/v0.12.0
+
+# 3. 删 GitHub Release（默认会保留 tag，加 --cleanup-tag 一并删 tag）
+gh release delete v0.12.0 --yes --cleanup-tag
+```
+
+> **不可逆警告**：release 删了不可恢复（GitHub 不存历史快照）；tag 删了本地可重打，但远端如果有人已经 clone/fetch 过这个 tag，他们本地仍存在，会造成版本号混乱。**正式发出的 tag 不要删，错了就发新 tag（如 v0.12.1）替换**。
+
+---
+
 ## 安全检查清单（push 前必过）
 
+**push 前**：
 - [ ] `git check-ignore .env` 显示被忽略 ✓
 - [ ] `git diff --cached | grep -E "sk-[A-Za-z0-9]{20,}|sk-ant-|ghp_|AIza"` **无任何匹配** ✓
 - [ ] `git status --porcelain | grep -E "\.cursor/docs/|WORK_IN_PROGRESS"` 无输出 ✓
@@ -205,6 +313,12 @@ git config user.name "<你想显示的名字>"
 - [ ] 远端有 `upstream` 和 `origin` 两个，分别指向上游和你的 fork ✓
 - [ ] `.git/shallow` 不存在（或已经 `git fetch --unshallow upstream`）✓
 - [ ] commit message 写明 baseline + 改动主题 ✓
+
+**push 后收尾（Step 8）**：
+- [ ] 已合并的临时同步分支已删（本地 `git branch -d` + 远端 `git push origin --delete`）✓
+- [ ] 版本节点 tag 已打 + 推送到 origin（如需）✓
+- [ ] GitHub Release 已创建（如需正式发布记录）✓
+- [ ] `git ls-remote --heads origin` 只显示需要保留的分支 ✓
 
 ---
 
@@ -218,9 +332,15 @@ git config user.name "<你想显示的名字>"
 | `error: src refspec main does not match any` | 本地不在 main 分支 / 没 commit | `git switch -c main` + `git commit` |
 | `Permission denied (publickey)` | SSH key 没配到 GitHub | `gh auth login` 或 `ssh-keygen + 加到 GitHub` |
 | `Could not access submodule '<name>' at commit <hash>` (warning) | submodule 仓库无访问权限 | 警告无害，可忽略；不影响 push |
+| `error: The branch '<x>' is not fully merged` （删分支时）| 分支还没合并到 main，`-d` 拒绝删 | 先 `git merge` 或确认能丢，再 `git branch -D <x>`（force） |
+| `error: could not write config file .git/config: Operation not permitted` （删分支/push 时）| sandbox 限制写 .git/config | 不影响实际删除/push 结果，残留 tracking 配置可手动 unset |
+| `! [rejected] v<X.Y.Z> -> v<X.Y.Z> (already exists)` | 远端已有同名 tag | 决定是 force（`git push origin v<X.Y.Z> --force`，**慎用**）还是用新版本号 |
+| `gh: command not found` | 未安装 GitHub CLI | `brew install gh`（macOS）或 https://cli.github.com/ ；或在 GitHub 网页手动建 release |
 ---
 
 ## 以后同步上游新版本（标准动作）
+
+> **重大版本同步走 `/sp_sync_upstream_release`**：如果上游打了正式 release tag（如 v0.12.0 / v0.13.0）且 fork 已经分叉很远（>5 个文件冲突），优先用 `.cursor/commands/sp_sync_upstream_release.md` —— 它有完整的 worktree 隔离、防 `hermes update` 抢资源、11 类冲突决策树、回归测试等防御。下面这一节只适合**本地与上游差异很小**（<3 文件冲突）的快速增量同步。
 
 push 完成后，以后每次上游 hermes-agent 出新版本，按这套节奏：
 
@@ -244,6 +364,10 @@ git rebase upstream/main          # B. rebase（线性历史，会改 commit has
 # 5. 测试 + push
 scripts/run_tests.sh
 git push origin main
+
+# 6. （可选）按 Step 8 收尾：清理临时分支 + 打 tag
+#    git branch -d <临时分支> && git push origin --delete <临时分支>
+#    git tag -a v<X.Y.Z> -m "..." && git push origin v<X.Y.Z>
 ```
 
 > **冲突处理铁律**：先 `git diff --check` 看冲突边界，再决定 ours/theirs/手动 merge；**不确定时先 `git merge --abort` 回退**，问清楚再来。
