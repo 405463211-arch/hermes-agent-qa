@@ -37,6 +37,8 @@
 | **每个冲突都要列"差异 + 影响 + 决策"三栏**：让用户拍板，不要自作主张 | 11 个冲突里有 6 个属于"两者都保"，3 个"取本地"，2 个"取上游"，没有通用答案 |
 | **本地隐私不要随上游漂出去**：硬编码路径、个人 venv 等必须脱敏 | 测试文件里的 `~/PyCharmMiscProject/...venv/bin/python` 漂入上游会暴露本机结构 |
 | **不要拒绝写 change-detector 测试的本地版**：上游加的「列出 27 个工具名」类测试脆弱 | 本地 anchor 模式（只断言关键工具子集）符合 `AGENTS.md` 反 change-detector 准则 |
+| **合并后必跑静默合丢审计**：`bash scripts/audit_merge_loss.sh` | 2026-05-07 v0.12.0 合并后发现：当上游"重写整段"时 git 不会标 `<<<<<<<` 冲突，会**静默丢**你 baseline 加的代码（如 `_BUNDLED_PLUGIN_DIR` → `get_bundled_plugins_dir()` 重写时连带丢了 9 行 `auto_enable` 实现）|
+| **CI 失败要分主次诊断（4 类根因模式）**：上游自破 / 本地撞车 / 静默合丢 / Fork 缺 secret | 见 Step 8.6；不同根因修法完全不同——别把上游 bug 当成本地问题去倒推 |
 
 ---
 
@@ -264,6 +266,103 @@ bash scripts/run_tests.sh
 
 ---
 
+### Step 8.5：合并后静默合丢审计（**v0.12.0 之后必跑**）
+
+**为什么必须跑**：当上游"重写整段代码"时（例如把 `X: Path = ...` 模块常量改成 `def get_X() -> Path: ...` 函数），git 三向合并把它当成"上游单方面动作"——**不会标 `<<<<<<<` 让你解决冲突**，但你 baseline 在那一段加过的代码会被一并吞掉。`git show --cc <merge> -- <file>` 输出空就是这种情况的指纹。
+
+跑审计脚本：
+
+```bash
+# 自动定位最近的 LOCAL_BASELINE（commit subject 含 "snapshot:"），扫所有它修改过的文件
+bash scripts/audit_merge_loss.sh
+
+# 或显式指定 baseline
+bash scripts/audit_merge_loss.sh 6198fe35f
+```
+
+**脚本工作原理**：
+
+1. 对每个 baseline 修改过的代码文件，计算 `snapshot_adds ∩ merge_dels`（baseline 加 ∩ merge 删）
+2. 自动区分两类「丢失」：
+   - **code-bearing**（含 `def / class / import / = / -> / @decorator` 等）→ 真实风险，必须人工核对
+   - **docstring/注释**（纯字符串、不含代码关键字）→ 大概率是上游重写注释的良性变化
+3. 输出风险文件清单 + 前几行丢失内容预览
+
+**4 类常见误报**（脚本提示已包含，遇到不要慌）：
+
+| 误报模式 | 例子 | 验证方法 |
+|---|---|---|
+| 结构性短行被去重 | `else:` / `try:` / `except Exception:` | 这种行 baseline 和 HEAD 都有多次出现，`sort -u` 之后看不到上下文位置 |
+| 上游重写 docstring | `agent/context_engine.py` 的 `Args:` 风格 | `grep <参数名>` 在 HEAD 里能找到说明参数还在 |
+| 函数升级保留旧版 | `_run_child_with_callbacks` → `_run_with_thread_capture` | `git grep <旧函数名>` 仍能找到说明上游加新的没删旧的 |
+| 测试 fixture 脱敏 | `automation.adb` → `sample_pkg.adb` | 测试方法名仍在 HEAD 里说明逻辑保留 |
+
+**真合丢的指纹**（vs 上面的误报）：
+
+- `git grep <symbol>` 在 HEAD 整个仓库**完全找不到**
+- `git show --cc <merge> -- <file>` 输出空（无冲突标记）
+- 但 `git diff <baseline>..HEAD -- <file>` 显示删除了 baseline 加的具体行
+
+**v0.12.0 真实案例**（`hermes_cli/plugins.py` 9 行 `auto_enable` 实现合丢）：
+
+```bash
+# baseline 加过的关键标识符
+git grep "auto_enable" hermes_cli/plugins.py     # → 0 hits（HEAD 完全没有）
+git show 6198fe35f:hermes_cli/plugins.py | grep "auto_enable"  # → 9 hits（baseline 有）
+git show --cc 4f7c71c3c -- hermes_cli/plugins.py # → 空（git 没标冲突）
+# 结论：合丢 → 必须从 baseline 反向恢复
+```
+
+---
+
+### Step 8.6：CI 失败时的「主次诊断」(**4 类根因模式**)
+
+合并后第一次 push，GitHub Actions 经常会跑出几个失败。**不要按测试名一个一个去倒推**——先按下面 4 类根因分流，然后对症下药：
+
+| 根因模式 | 触发条件 | 典型征兆 | 修法 |
+|---|---|---|---|
+| **A. 上游自破（漏改测试）** | 上游某个 PR 改了实现但没改对应测试 | 失败的测试是上游 PR 加的 + 报 `TypeError: got an unexpected keyword argument`、`AssertionError: expected X got Y` 等签名/契约错位 | 给 mock 加 `**kwargs` / 更新断言；上游迟早会自己修，但 fork 等不起 |
+| **B. Fork 缺 secret / 环境** | workflow 引用 `secrets.APP_ID` 之类只有上游配的密钥 | `Error: Input required and not supplied: app-id` 类 step-level 失败；workflow 第一步就崩 | workflow 加 `if: github.repository == '<upstream-owner>/<repo>'` 守卫，跳过 fork |
+| **C. 上游测试 + 本地特性撞车** | 上游加了"严苛断言"测试（`assert X == set()`），本地 baseline 加了一些会出现在 X 里的额外内容 | 失败的测试是**新引入**的（不在你之前的 push 历史里）；diff 显示 `+ 'local_thing_1', + 'local_thing_2'` | 把本地新增的项加进相应"白名单/排除集合"（例如 `_DEFAULT_OFF_TOOLSETS`） |
+| **D. 静默合丢** | 上游"重写整段"+ baseline 加过同段；测试沿用 baseline 引用了被丢的实现 | 测试用 `monkeypatch.setattr(..., raising=False)` 调一个**HEAD 不存在**的属性；测试逻辑预期某个功能但功能已不在 | 跑 `scripts/audit_merge_loss.sh` 定位 → 从 baseline 恢复实现 |
+
+**诊断流程**（**v0.12.0 实战经验**）：
+
+```bash
+# 1. 列出失败测试
+# 2. 对每个失败按以下顺序判断：
+
+# (a) 测试本身是不是 v0.12.0 引入的？
+git log --all --oneline -S "<test_function_name>" -- 2>&1 | head -5
+git merge-base --is-ancestor <test_intro_commit> <merge_commit> && echo "yes upstream-introduced"
+# 如果是 upstream-introduced + 失败 → 大概率 模式 A 或 模式 C
+
+# (b) 失败的代码路径里，被调用的实现还在不在？
+git grep "<symbol_in_test_assertion>" -- '*.py'
+# 如果搜不到 → 模式 D（静默合丢）
+
+# (c) 失败的报错是不是 "Input required" / "Not Found" 这种 workflow-level？
+# → 模式 B，去 .github/workflows/ 查 secrets 引用
+
+# (d) 失败的 + 多出的内容是不是 baseline 加过的？
+git show <baseline> -- <related_file> | grep '<extra_item>'
+# 如果是 → 模式 C
+```
+
+**v0.12.0 实测 8 个失败的根因分布**：
+
+| 失败 | 模式 | 修法 |
+|---|---|---|
+| `tests/acp/test_mcp_e2e.py` x2 | A — 上游 `cdf9793d6` 改 `run_conversation` 加 `persist_user_message=` 没改 mock | mock 加 `**kwargs` |
+| `Nix Lockfile / auto-fix-main` | B — workflow 用 `secrets.APP_ID` | 加 `if: github.repository == 'NousResearch/hermes-agent'` |
+| `test_get_platform_tools_preserves_explicit_empty_selection` | C — 上游 `d07d86771` 测试 + baseline 加的 3 个本地 toolset 撞车 | `_DEFAULT_OFF_TOOLSETS` 加入 `learning/obsidian/project_knowledge` |
+| `test_load_enabled_toolsets_*` x2 | C — 同上 | 同上 |
+| `TestPluginAutoEnable` x3 | D — baseline 9 行 `auto_enable` 实现被静默合丢 | 从 baseline 恢复 9 行 |
+
+> **关键认识**：每类根因的"修复地点"完全不同：A 改测试、B 改 workflow、C 改业务配置（_DEFAULT_OFF_TOOLSETS）、D 改业务实现（plugins.py）。把它们混为一谈会让人疯掉，必须先分类。
+
+---
+
 ### Step 9：推送回上游分支 + 合到 main
 
 ```bash
@@ -360,6 +459,32 @@ git stash pop
 
 ---
 
+### Case D：合并完成 push 后 CI 报失败，但本地没冲突标记 / merge commit 看起来"干净"
+
+**最容易踩的坑** — git 三向合并把"上游重写整段"识别为单方面动作，**静默丢**了你 baseline 里加在那段的代码。`git show --cc <merge> -- <file>` 输出空就是这种情况。
+
+```bash
+# 1. 跑静默合丢审计（自动定位 baseline）
+bash scripts/audit_merge_loss.sh
+
+# 2. 对每个标 ⚠ 的文件，做"实际还在不在"检查
+git grep "<key_symbol_from_baseline>" -- '<file>'
+git show <baseline>:<file> | grep -A2 "<key_symbol>"   # baseline 加了什么
+
+# 3. 验证 git merge 在那个文件上是否真的"无冲突合并"
+git show --cc <merge_commit> -- <file>                 # 输出空 = 静默合并（高危）
+git diff <baseline>..HEAD -- <file> | grep "^-.*<key_symbol>" | head    # 看具体删了什么
+
+# 4. 从 baseline 反向恢复（按需手工 cherry-pick 几个块到当前 HEAD）
+git show <baseline>:<file> > /tmp/baseline_version.py
+diff -u <file> /tmp/baseline_version.py                # 看哪些 baseline 块需要补回
+# 然后用 StrReplace / 编辑器手工恢复，不要用 git checkout — 那会覆盖上游也加的内容
+```
+
+**v0.12.0 实战**：`hermes_cli/plugins.py` 丢了 9 行 `auto_enable` 实现，恢复方法见 `.cursor/prompts/v0.12.0_upgrade_notes.md` §9.3。
+
+---
+
 ## 检查清单（合并完成前过一遍）
 
 - [ ] `grep -rnE "^<<<<<<< |^=======$|^>>>>>>> "` 输出为空
@@ -370,6 +495,8 @@ git stash pop
 - [ ] 测试通过（或失败均为上游已有 bug，已 stash 验证过）
 - [ ] 没有把硬编码本地路径泄露到上游
 - [ ] `.cursor/prompts/v<version>_upgrade_notes.md` 已写
+- [ ] **`bash scripts/audit_merge_loss.sh` 通过 / 所有 ⚠ 都已人工核对为良性变化**（Step 8.5）
+- [ ] **GitHub Actions CI 全绿，或所有失败都按 4 类根因模式分类并修过**（Step 8.6）
 - [ ] 已 push origin sync/v<version>
 - [ ] 已 ff-only 合到 main + push origin main
 
