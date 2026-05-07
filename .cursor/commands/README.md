@@ -4,14 +4,15 @@
 
 ## 这是什么
 
-三件套 + 一份索引：
+**主线三件套**（hermes 调试闭环）+ **独立工作流**（GitHub 同步）+ 一份索引：
 
 | 文件 | 命令 | 阶段 | 做什么 |
 |---|---|---|---|
 | `sp_brainstorm.md` | `/sp_brainstorm` | 1. 设计 | 苏格拉底式提问 → 多方案 → 架构红线检查 → 落地设计文档 |
 | `sp_plan.md` | `/sp_plan` | 2. 计划 | 把方案拆成 2-5 分钟小任务，每任务带精确路径 + 验证命令 |
-| `sp_execute.md` | `/sp_execute` | 3-7. 执行 | 分批执行 + 检查点 + 双向落盘（plan 状态 + execute 进度） |
-| `README.md` | — | 索引 | 三件套使用指南（本文件） |
+| `sp_execute.md` | `/sp_execute` | 3-7. 执行 | 分批执行 + 检查点 + 双向落盘(plan 状态 + execute 进度) |
+| `sp_sync_github.md` | `/sp_sync_github` | 独立 | 安全把本地工程同步到 GitHub：密钥扫描 / shallow 修复 / fork README 冲突 / commit 身份等 |
+| `README.md` | — | 索引 | 全套使用指南（本文件） |
 
 ## 三件套工作流
 
@@ -87,6 +88,30 @@
 ```
 
 **铁律：复现失败就别"试着修一下"，回去重新分析现象。**
+
+### 场景四：把本地工程同步到 GitHub（独立工作流，不走三件套）
+
+```
+/sp_sync_github                              # 默认推到当前 origin
+/sp_sync_github 推到我的新仓库 git@github.com:xxx/yyy.git
+```
+
+适用：
+
+- 第一次把本地工程推到一个**新建的 GitHub 仓库**（处理 README 冲突、Initial commit）
+- 本地有大量 untracked / modified 文件，需要先做密钥安全扫描再 push
+- 上游 hermes-agent 出新版本前，先把本地 wip 推到 fork 备份避免被覆盖
+- 仓库是 shallow clone（`.git/shallow` 存在）导致 push 失败（`did not receive expected object`）
+- 推完发现 GitHub contribution graph 不增加（committer 身份没配对）
+
+**核心铁律**：
+
+- 公开仓库先扫密钥再 push（不可逆）
+- "点开头" ≠ "隐私"（`.gitignore` `.envrc` `.github/` 等本来就该公开）
+- `git fetch --unshallow upstream` **只补 git 数据库，不动代码**
+- shallow clone 不能 push，必须先 unshallow
+
+完整流程见 `sp_sync_github.md`。
 
 ## hermes-agent 架构红线（设计 / 计划 / 执行全程对照）
 
