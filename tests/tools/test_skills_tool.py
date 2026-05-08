@@ -391,6 +391,52 @@ class TestSkillView:
         assert "Current date: 2026-04-24" in result["content"]
         assert "!`printf 2026-04-24`" not in result["content"]
 
+    def test_skill_view_handles_date_in_frontmatter_metadata(self, tmp_path):
+        """Regression: ``last_validated: 2026-05-01`` in YAML frontmatter is
+        parsed by PyYAML into ``datetime.date`` and previously broke
+        ``json.dumps`` with ``Object of type date is not JSON serializable``.
+
+        See session 20260508_142457 — visual-ui-automation skill failed for
+        exactly this reason. The fix lives in ``tools/skills_tool._json_default``.
+        """
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "dated-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    tags: [ui-automation]\n"
+                    "    last_validated: 2026-05-01\n"
+                ),
+            )
+            raw = skill_view("dated-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "dated-skill"
+        last_validated = result["metadata"]["hermes"]["last_validated"]
+        assert last_validated == "2026-05-01"
+        assert isinstance(last_validated, str)
+
+    def test_skill_view_handles_datetime_and_set_in_metadata(self, tmp_path):
+        """Other YAML-introducible non-JSON types must also serialise cleanly."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "dt-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    last_validated: 2026-05-01T10:30:00\n"
+                ),
+            )
+            raw = skill_view("dt-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["metadata"]["hermes"]["last_validated"].startswith("2026-05-01T10:30:00")
+
     def test_skill_view_leaves_inline_shell_literal_when_disabled(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),

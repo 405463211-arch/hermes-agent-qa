@@ -68,6 +68,7 @@ Usage:
 
 import json
 import logging
+from datetime import date, datetime
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -80,6 +81,24 @@ from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
+
+
+def _json_default(obj):
+    """Fallback encoder for ``json.dumps`` so YAML-parsed values survive serialisation.
+
+    PyYAML coerces ISO date literals (e.g. ``last_validated: 2026-05-01`` in skill
+    frontmatter) into ``datetime.date`` / ``datetime.datetime`` objects. Those are
+    not JSON-native, so without this hook ``json.dumps`` would raise
+    ``TypeError: Object of type date is not JSON serializable`` and break
+    ``skill_view`` for any skill carrying date metadata.
+    """
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj, key=str)
+    if isinstance(obj, Path):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -843,6 +862,7 @@ def _serve_plugin_skill(
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
         },
         ensure_ascii=False,
+        default=_json_default,
     )
 
 
@@ -1395,7 +1415,7 @@ def skill_view(
         except Exception:
             pass
 
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False, default=_json_default)
 
     except Exception as e:
         return tool_error(str(e), success=False)

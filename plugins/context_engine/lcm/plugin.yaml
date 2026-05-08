@@ -6,8 +6,8 @@ description: |
   instead of relying on a lossy LLM-generated summary.
 
   Especially useful for long sessions on slower providers (GLM-5.1,
-  DeepSeek-R1) where the standard compression's two extra LLM calls
-  per cycle (flush_memories + summarize) create noticeable latency.
+  DeepSeek-R1) where the standard compression's auxiliary summarize
+  call can take 30-90s and lose detail across many compression cycles.
 
 version: 0.1.0
 author: hermes-agent

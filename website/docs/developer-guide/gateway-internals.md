@@ -223,21 +223,28 @@ AIAgent._invoke_tool()
 
 4. On session end/reset, `on_session_end()` fires for cleanup and final data flush
 
-### Memory Flush Lifecycle
+### Session Boundary Lifecycle
 
 When a session is reset, resumed, or expires:
-1. Built-in memories are flushed to disk
-2. Memory provider's `on_session_end()` hook fires
-3. A temporary `AIAgent` runs a memory-only conversation turn
+1. Built-in memories are already on disk (written in-band by the `memory` tool during normal turns)
+2. Memory provider's `on_session_end(messages)` hook fires for final extraction
+3. `on_session_finalize` plugin hook fires for any session-scoped cleanup
 4. Context is then discarded or archived
+
+In-band memory saves happen during normal conversation via the
+`memory.nudge_interval` mechanism (every N user turns the agent gets a
+prompt to consider saving), so there is no separate "flush turn" at the
+boundary. The earlier `flush_memories` mechanism was removed in
+upstream PR #15696 because it broke prompt caching by temporarily swapping
+to a memory-only toolset; the in-band nudge is more frequent and does
+not invalidate the cache.
 
 ## Background Maintenance
 
 The gateway runs periodic maintenance alongside message handling:
 
 - **Cron ticking** — checks job schedules and fires due jobs
-- **Session expiry** — cleans up abandoned sessions after timeout
-- **Memory flush** — proactively flushes memory before session expiry
+- **Session expiry** — cleans up abandoned sessions after timeout (fires `on_session_finalize` + memory `on_session_end`)
 - **Cache refresh** — refreshes model lists and provider status
 
 ## Process Management

@@ -200,9 +200,15 @@ done
 grep -rnE "^<<<<<<< |^=======$|^>>>>>>> " --include="*.py" --include="*.md" .
 
 # 关键功能 anchor 检查（按本次合并经验）
-grep -c "def flush_memories\|def _compact_with_progress" run_agent.py    # 本地核心方法是否还在
+grep -c "def _compact_with_progress" run_agent.py                        # 本地核心方法是否还在
 grep -c "_needs_thinking_reasoning_pad\|_needs_kimi_tool_reasoning" run_agent.py  # 上游重构是否进来
 grep -c "Local override.*regression guard" run_agent.py                  # 本次新增的回归防御注释
+
+# 反向 anchor（出现就警告 — 见 v0.12.0_upgrade_notes.md §10）
+# `flush_memories` 是 v0.12.0 误判保留的孤儿，已于 2026-05-07 撤销。
+# 任何下次合并里它再次出现 → 大概率是上游回炉或者合并者重蹈覆辙。
+[ "$(grep -c 'def flush_memories\|self\.flush_memories\|agent\.flush_memories' run_agent.py cli.py 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')" = "0" ] \
+  || echo "⚠ flush_memories reappeared — read v0.12.0_upgrade_notes.md §10 before keeping"
 ```
 
 ---
