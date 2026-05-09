@@ -31,7 +31,7 @@ from plugins.context_engine.lcm.engine import (
     _TOOL_RESULT_SEGMENT_CHARS,
     _TOOL_RESULT_SOFT_LIMIT_CHARS,
 )
-from plugins.context_engine.lcm.store import ChunkStore
+from plugins.context_engine.lcm.store import ChunkStore, _chunk_content_hash
 
 
 @pytest.fixture(autouse=True)
@@ -838,39 +838,389 @@ class TestNeighborExpansion:
         assert len(result["matches"]) <= 7
 
     def test_neighbors_do_not_cross_session_boundary(self, tmp_path):
-        """A chunk in session A must never surface as a neighbour for a
-        match in session B, even when their SQLite ids happen to be
-        adjacent."""
-        # Session A
+        """A search in session B must only return chunks ATTACHED to
+        session B, even when adjacent ``chunks.id`` values were first
+        inserted by session A.
+
+        Under the dedup schema two sessions can legitimately share a
+        chunk row when their content matches — so we verify the
+        attachment side via ``chunk_sessions`` rather than the legacy
+        ``chunks.session_id`` (which only records the first session).
+        Session A is populated with one set of sentinels and session B
+        with a *different* set, so no dedup overlap should occur and
+        every returned chunk must come back as B-attached.
+        """
         eng = _make_engine(tmp_path)
+
+        def _populate_with_prefix(prefix: str, n_msgs: int = 4) -> None:
+            long_chunk = "x " * 200
+            msgs = [{"role": "system", "content": "sys"}]
+            msgs.append({"role": "user", "content": f"intro {prefix} " + long_chunk})
+            msgs.append({"role": "assistant", "content": f"ack {prefix} " + long_chunk})
+            for i in range(n_msgs):
+                role = "user" if i % 2 == 0 else "assistant"
+                msgs.append({
+                    "role": role,
+                    "content": f"{prefix}-sentinel-{i:02d} {long_chunk}",
+                })
+            msgs.append({"role": "user", "content": f"recent {prefix} " + long_chunk})
+            msgs.append({"role": "assistant", "content": f"rec ans {prefix} " + long_chunk})
+            msgs.append({"role": "user", "content": f"latest-{prefix}"})
+            eng.compress(msgs, current_tokens=20000)
+
         eng.on_session_start("session-a")
-        self._populate_session(eng, n_msgs=4)
+        _populate_with_prefix("alpha")
         a_chunk_count = eng._ensure_store().session_chunk_count("session-a")
         assert a_chunk_count > 0
 
-        # Session B in the same store
         eng.on_session_start("session-b")
-        self._populate_session(eng, n_msgs=4)
+        _populate_with_prefix("bravo")
         b_chunk_count = eng._ensure_store().session_chunk_count("session-b")
         assert b_chunk_count > 0
 
-        # Search session B with a generous neighbour window
         result = json.loads(eng.handle_tool_call(
             "lcm_search",
-            {"query": "sentinel-01", "k": 5, "neighbors": 3},
+            {"query": "bravo-sentinel-01", "k": 5, "neighbors": 3},
         ))
-        # Recall every returned id and assert all of them belong to B.
         ids = [m["id"] for m in result["matches"]]
+        assert ids, "expected at least one match for bravo-sentinel-01"
         store = eng._ensure_store()
         with store._lock:
-            sessions = {
-                int(r[0]): r[1] for r in store._conn.execute(
-                    f"SELECT id, session_id FROM chunks "
-                    f"WHERE id IN ({','.join('?' * len(ids))})",
-                    ids,
+            attached_to_b = {
+                int(r[0]) for r in store._conn.execute(
+                    f"SELECT chunk_id FROM chunk_sessions "
+                    f"WHERE chunk_id IN ({','.join('?' * len(ids))}) "
+                    f"AND session_id = ?",
+                    ids + ["session-b"],
                 ).fetchall()
             }
         for cid in ids:
-            assert sessions[cid] == "session-b", (
-                f"chunk {cid} leaked across sessions: {sessions[cid]}"
+            assert cid in attached_to_b, (
+                f"chunk {cid} not attached to session-b — leaked across sessions"
             )
+
+
+# ---------------------------------------------------------------------------
+# Cross-session content dedup (the actual bug we're fixing)
+# ---------------------------------------------------------------------------
+
+
+class TestCrossSessionDedup:
+    """Identical content under two session_ids must share one chunk row.
+
+    Real-world triggers for the same content reaching two session_ids:
+    * ``hermes --resume <old_sid>`` then natural compression in the
+      resumed session — old + replayed messages compress under the new
+      session_id.
+    * ACP ``fork_session()`` deep-copies history into a fresh session_id.
+    * ``run_agent.py`` rotates ``session_id`` on every compression
+      boundary (line 9411), so a single conversation legitimately spans
+      multiple session_ids over its lifetime.
+
+    Before this fix we'd write the SAME content twice — exactly what
+    the user hit (315 unique chunks → 630 rows).  These tests pin down
+    the cross-session sharing contract.
+    """
+
+    def _make_store(self, tmp_path: Path) -> ChunkStore:
+        return ChunkStore(tmp_path / "lcm" / "store.db")
+
+    def test_same_content_two_sessions_shares_one_row(self, tmp_path):
+        store = self._make_store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        chunks = [
+            {"role": "user", "content": "shared question about pay"},
+            {"role": "assistant", "content": "shared answer in pay.dart"},
+        ]
+        embeddings = emb.embed([c["content"] for c in chunks])
+
+        ids_a = store.add("session-A", chunks, embeddings, "lexical-hash")
+        ids_b = store.add("session-B", chunks, embeddings, "lexical-hash")
+
+        # Same chunk IDs returned — dedup hit on every chunk.
+        assert ids_a == ids_b
+        # Only ONE row per unique content in the chunks table.
+        with store._lock:
+            row_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0]
+        assert row_count == len(chunks), (
+            f"expected {len(chunks)} unique rows after dedup, got {row_count}"
+        )
+        # Each session sees both chunks via its attachments.
+        assert store.session_chunk_count("session-A") == len(chunks)
+        assert store.session_chunk_count("session-B") == len(chunks)
+
+    def test_same_content_same_session_idempotent(self, tmp_path):
+        """Calling add() twice with the same content in one session
+        must not create duplicate attachments."""
+        store = self._make_store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        chunks = [{"role": "user", "content": "repeated"}]
+        embeddings = emb.embed(["repeated"])
+
+        ids_first = store.add("S", chunks, embeddings, "lexical-hash")
+        ids_second = store.add("S", chunks, embeddings, "lexical-hash")
+        assert ids_first == ids_second
+        assert store.session_chunk_count("S") == 1
+        with store._lock:
+            row_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0]
+        assert row_count == 1
+
+    def test_different_embedders_do_not_dedup(self, tmp_path):
+        """Two embedders produce incompatible vectors — must keep both rows.
+
+        Otherwise a cross-embedder search would hit the wrong vector
+        space and return garbage scores.
+        """
+        store = self._make_store(tmp_path)
+        emb_a = LexicalEmbedder(dim=64)
+        emb_b = LexicalEmbedder(dim=128)
+        chunk = [{"role": "user", "content": "same text"}]
+
+        store.add("S", chunk, emb_a.embed(["same text"]), "lexical-hash-a")
+        store.add("S", chunk, emb_b.embed(["same text"]), "lexical-hash-b")
+
+        with store._lock:
+            row_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0]
+        assert row_count == 2, (
+            "different embedders must keep separate rows for the same content"
+        )
+
+    def test_role_difference_breaks_dedup(self, tmp_path):
+        """Identical body under different roles is semantically different."""
+        store = self._make_store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        body = "ambiguous text"
+        store.add(
+            "S",
+            [{"role": "user", "content": body}],
+            emb.embed([body]),
+            "lexical-hash",
+        )
+        store.add(
+            "S",
+            [{"role": "assistant", "content": body}],
+            emb.embed([body]),
+            "lexical-hash",
+        )
+        with store._lock:
+            row_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0]
+        assert row_count == 2
+
+    def test_search_finds_shared_chunk_from_either_session(self, tmp_path):
+        store = self._make_store(tmp_path)
+        emb = LexicalEmbedder(dim=128)
+        shared = [
+            {"role": "user", "content": "shared payment lookup"},
+            {"role": "assistant", "content": "shared answer about pay flow"},
+        ]
+        store.add("A", shared, emb.embed([c["content"] for c in shared]), "lex")
+        store.add("B", shared, emb.embed([c["content"] for c in shared]), "lex")
+
+        q = emb.embed(["payment"])[0]
+        results_a = store.search("A", q, k=5)
+        results_b = store.search("B", q, k=5)
+        # Both sessions return the same shared chunks.
+        assert {r["id"] for r in results_a} == {r["id"] for r in results_b}
+        assert len(results_a) == 2
+
+    def test_delete_session_keeps_chunks_shared_with_others(self, tmp_path):
+        """Deleting session A must NOT remove chunks B still references."""
+        store = self._make_store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        shared = [{"role": "user", "content": "shared"}]
+        a_only = [{"role": "user", "content": "only-in-A"}]
+
+        store.add("A", shared + a_only,
+                  emb.embed(["shared", "only-in-A"]), "lex")
+        store.add("B", shared, emb.embed(["shared"]), "lex")
+
+        # Sanity: A has 2, B has 1 (deduped).
+        assert store.session_chunk_count("A") == 2
+        assert store.session_chunk_count("B") == 1
+
+        store.delete_session("A")
+
+        # B's attachment survived; its chunk wasn't GC'd.
+        assert store.session_chunk_count("B") == 1
+        b_results = store.search("B", emb.embed(["shared"])[0], k=5)
+        assert any("shared" in r["preview"] for r in b_results)
+        # The A-only chunk WAS garbage-collected (no other session held it).
+        with store._lock:
+            row_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0]
+        assert row_count == 1, "orphan chunk should be GC'd after delete_session"
+
+    def test_neighbors_use_per_session_seq_not_chunk_id(self, tmp_path):
+        """Two sessions with different content interleaved in chunks.id —
+        neighbours of a B-chunk must come from B's own seq, never from A.
+
+        Without per-session seq, neighbours-by-id would pull A chunks
+        whose autoincrement id happens to land next to a B chunk's id.
+        """
+        store = self._make_store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        # Interleave A and B inserts so their chunk_ids alternate.
+        for i in range(3):
+            store.add("A", [{"role": "user", "content": f"a-{i}"}],
+                      emb.embed([f"a-{i}"]), "lex")
+            store.add("B", [{"role": "user", "content": f"b-{i}"}],
+                      emb.embed([f"b-{i}"]), "lex")
+
+        # Find B's middle chunk (b-1).
+        results = store.search("B", emb.embed(["b-1"])[0], k=1)
+        assert results, "expected b-1 to be found in session B"
+        b_mid_id = results[0]["id"]
+        # Pull a wide neighbour window — every returned chunk must
+        # belong to B (no A leakage via id-adjacency).
+        neighbours = store.neighbors("B", b_mid_id, before=5, after=5)
+        assert neighbours
+        for n in neighbours:
+            assert "a-" not in n["preview"], (
+                f"session A leaked into B's neighbours: {n['preview']!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Schema migration — pre-dedup DBs must boot without losing data
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyMigration:
+    """Boot a ChunkStore against a hand-crafted pre-dedup DB and check
+    that it backfills ``content_hash`` + ``chunk_sessions`` so existing
+    sessions keep working after the user upgrades."""
+
+    def _build_legacy_db(self, db_path: Path) -> None:
+        """Create a DB with the old (no-dedup) schema and a few rows."""
+        import sqlite3
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                preview TEXT NOT NULL,
+                embedding BLOB,
+                embedder TEXT,
+                dim INTEGER,
+                chunk_type TEXT DEFAULT 'message',
+                created_at REAL NOT NULL
+            );
+        """)
+        # Insert a few legacy rows with deterministic embeddings so the
+        # migration's content_hash computation is the only step under
+        # test (we don't exercise the embedder here).
+        legacy_rows = [
+            ("legacy-S1", "user", "first legacy turn", 1.0),
+            ("legacy-S1", "assistant", "legacy reply", 2.0),
+            ("legacy-S2", "user", "another session start", 3.0),
+        ]
+        for sid, role, content, ts in legacy_rows:
+            conn.execute(
+                "INSERT INTO chunks "
+                "(session_id, role, content, preview, embedding, embedder, "
+                " dim, chunk_type, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sid, role, content, content[:50],
+                    np.zeros(64, dtype=np.float32).tobytes(),
+                    "lex", 64, "user_text" if role == "user" else "assistant_decision",
+                    ts,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+    def test_migration_adds_column_and_backfills_attachments(self, tmp_path):
+        db_path = tmp_path / "lcm" / "store.db"
+        self._build_legacy_db(db_path)
+
+        # Open under the new schema — migration should run automatically.
+        store = ChunkStore(db_path)
+
+        with store._lock:
+            cols = {
+                row[1]
+                for row in store._conn.execute("PRAGMA table_info(chunks)")
+            }
+            assert "content_hash" in cols, "ALTER TABLE should add content_hash"
+
+            # Every legacy row got a chunk_sessions attachment.
+            attach_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunk_sessions"
+            ).fetchone()[0]
+            chunk_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0]
+            assert attach_count == chunk_count == 3
+
+            # content_hash backfilled for every row.
+            null_hashes = store._conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE content_hash IS NULL"
+            ).fetchone()[0]
+            assert null_hashes == 0
+
+            # Hashes are correct (computable from role + chunk_type + content).
+            sample = store._conn.execute(
+                "SELECT role, chunk_type, content, content_hash FROM chunks"
+            ).fetchall()
+            for role, ctype, content, h in sample:
+                assert h == _chunk_content_hash(role, ctype or "message", content)
+
+        # Reading via the public API still works.
+        assert store.session_chunk_count("legacy-S1") == 2
+        assert store.session_chunk_count("legacy-S2") == 1
+
+    def test_migration_is_idempotent(self, tmp_path):
+        """Running migration twice must not duplicate chunk_sessions rows."""
+        db_path = tmp_path / "lcm" / "store.db"
+        self._build_legacy_db(db_path)
+        ChunkStore(db_path).close()
+        store = ChunkStore(db_path)  # second open → migration runs again
+
+        with store._lock:
+            attach_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunk_sessions"
+            ).fetchone()[0]
+        assert attach_count == 3, (
+            f"expected 3 attachments after re-migration, got {attach_count}"
+        )
+
+    def test_migration_dedups_subsequent_inserts_against_legacy(self, tmp_path):
+        """After migration, fresh add() with content matching a legacy row
+        should reuse the existing chunk row instead of re-embedding."""
+        db_path = tmp_path / "lcm" / "store.db"
+        self._build_legacy_db(db_path)
+        store = ChunkStore(db_path)
+
+        emb = LexicalEmbedder(dim=64)
+        # Same content as legacy row 1 ("first legacy turn") under role=user.
+        ids = store.add(
+            "fresh-session",
+            [{"role": "user", "chunk_type": "user_text",
+              "content": "first legacy turn"}],
+            emb.embed(["first legacy turn"]),
+            "lex",
+        )
+        assert ids == [1], (
+            f"expected dedup to reuse legacy chunk id 1, got {ids}"
+        )
+        # Total rows in chunks unchanged — no new row was created.
+        with store._lock:
+            row_count = store._conn.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0]
+        assert row_count == 3
+        # But the new session is now ATTACHED to the legacy chunk.
+        assert store.session_chunk_count("fresh-session") == 1
