@@ -4,13 +4,14 @@
 
 ## 这是什么
 
-**主线三件套**（hermes 调试闭环）+ **两个独立工作流**（GitHub push / upstream merge）+ 一份索引：
+**主线三件套**（hermes 调试闭环）+ **测试设计辅助** + **两个独立工作流**（GitHub push / upstream merge）+ 一份索引：
 
 | 文件 | 命令 | 阶段 | 做什么 |
 |---|---|---|---|
 | `sp_brainstorm.md` | `/sp_brainstorm` | 1. 设计 | 苏格拉底式提问 → 多方案 → 架构红线检查 → 落地设计文档 |
 | `sp_plan.md` | `/sp_plan` | 2. 计划 | 把方案拆成 2-5 分钟小任务，每任务带精确路径 + 验证命令 |
 | `sp_execute.md` | `/sp_execute` | 3-7. 执行 | 分批执行 + 检查点 + 双向落盘(plan 状态 + execute 进度) |
+| `sp_test_design.md` | `/sp_test_design` | 横向（写测试前） | 6 轴覆盖检查（行为/不变量/幂等/跨参与方/迁移/可见状态）+ 历史失误索引 |
 | `sp_sync_github.md` | `/sp_sync_github` | 独立（出站） | 安全把本地工程同步到 GitHub：密钥扫描 / shallow 修复 / fork README 冲突 / commit 身份等 |
 | `sp_sync_upstream_release.md` | `/sp_sync_upstream_release` | 独立（入站） | 安全把上游新发布版（v0.x.0 tag）合并到本地 fork：worktree 隔离 / 防 hermes update 抢资源 / 11 类冲突决策 / 回归测试 |
 | `README.md` | — | 索引 | 全套使用指南（本文件） |
@@ -81,14 +82,33 @@
 ```
 1. /sp_brainstorm <现象 + 触发链路>
    → 现象、根因假设、复现命令、最小修复方案
-2. /sp_plan <brainstorm 路径>
-   → 任务 F0: 写复现用例（必须 RED）
+2. /sp_test_design <bug 涉及代码路径>
+   → 6 轴扫一遍：当前测试漏在哪一轴？RED 测试该锁哪一轴？
+3. /sp_plan <brainstorm 路径>
+   → 任务 F0: 写复现用例（必须 RED，测试维度由 sp_test_design 框定）
      任务 F1: 最小修复（让用例 GREEN）
-     任务 F2: 回归保障（相关目录 / 全量）
+     任务 F2: 回归保障 + 把这次失误追加到 sp_test_design.md "历史失误索引"
 3. /sp_execute <plan 路径>
 ```
 
 **铁律：复现失败就别"试着修一下"，回去重新分析现象。**
+**铁律：bug 修完，把这次"测试为什么没抓住"追加到 `sp_test_design.md` 历史失误索引。**
+
+### 场景五：写新功能 / 新模块（推荐 sp_test_design 横向插入）
+
+```
+1. /sp_brainstorm <功能> → 设计文档
+2. /sp_plan         → 任务拆分
+3. /sp_test_design  → 评审计划里"测试策略"那一节是否覆盖 6 轴
+4. /sp_execute      → 边写边看 sp_test_design 的 6 轴清单
+```
+
+**何时必跑 `/sp_test_design`**：
+
+- 新代码会写持久化状态（DB / 文件 / 缓存）
+- 涉及 session_id / tenant / profile / 多租户隔离
+- Schema / config 版本变更
+- 修复 bug 的 RED 测试（先想清楚锁哪一轴再下笔）
 
 ### 场景四：把本地工程同步到 GitHub（独立工作流，不走三件套）
 
