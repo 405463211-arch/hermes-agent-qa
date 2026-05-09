@@ -120,6 +120,29 @@ def _scan_memory_content(content: str) -> Optional[str]:
 
 VALID_TARGETS = ("rules", "memory", "user")
 
+# Minimum count of "substantive" characters (letters, digits, CJK ideographs)
+# required for a memory entry. Pure-punctuation or single-char entries like
+# ``.`` and ``.``` have shown up in production memory files (typically when
+# an LLM emits a fallback empty-token response that the tool used to accept).
+# These pollute the system prompt and serve no purpose, so we reject them.
+# Five chars passes "Lefty"/"我习惯" while rejecting "."/"-"/"。。。".
+_MIN_SUBSTANTIVE_CHARS = 3
+
+
+def _count_substantive_chars(text: str) -> int:
+    """Count alphanumeric + CJK characters in ``text``.
+
+    Used by ``MemoryStore.add`` to reject entries that consist entirely of
+    whitespace, punctuation, or symbols. CJK range covers the basic
+    Unified Ideographs block — sufficient for Chinese / Japanese kanji
+    inputs and avoids pulling in ``unicodedata`` for one check.
+    """
+    return sum(
+        1
+        for ch in text
+        if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+    )
+
 
 class MemoryStore:
     """
@@ -320,6 +343,21 @@ class MemoryStore:
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
+        # Reject pure-punctuation / single-char entries before they pollute
+        # the system prompt. See ``_count_substantive_chars`` above for the
+        # rationale and the production "." entry that motivated this check.
+        if _count_substantive_chars(content) < _MIN_SUBSTANTIVE_CHARS:
+            return {
+                "success": False,
+                "error": (
+                    f"Content lacks substantive characters "
+                    f"(need at least {_MIN_SUBSTANTIVE_CHARS} letters/digits/"
+                    f"CJK chars; got {_count_substantive_chars(content)}). "
+                    f"Memory entries must be meaningful prose, not "
+                    f"placeholders like '.' or '---'."
+                ),
+            }
+
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
         if scan_error:
@@ -460,6 +498,18 @@ class MemoryStore:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
+
+        # Apply the same substantive-content gate as ``add`` so a callsite
+        # can't sneak ``.``-style junk past via replace.
+        if _count_substantive_chars(new_content) < _MIN_SUBSTANTIVE_CHARS:
+            return {
+                "success": False,
+                "error": (
+                    f"new_content lacks substantive characters "
+                    f"(need at least {_MIN_SUBSTANTIVE_CHARS} letters/digits/"
+                    f"CJK chars; got {_count_substantive_chars(new_content)})."
+                ),
+            }
 
         # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)

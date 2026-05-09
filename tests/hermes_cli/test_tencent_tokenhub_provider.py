@@ -298,12 +298,27 @@ class TestTencentTokenhubURLMapping:
 
 
 class TestTencentTokenhubContextLength:
-    """hy3-preview context length is registered."""
+    """hy3-preview context length is registered as a 256K-tier model.
 
-    def test_hy3_preview_context_length(self):
+    The exact integer drifts depending on which resolution layer answers
+    first (offline / no-network = our hardcoded 256_000; online CI hits
+    models.dev and gets the upstream precise value 262_144 = 2^18, the
+    "true" 256K).  Both are correct — "256K-tier" is the invariant we
+    actually care about, not the byte-exact integer.  See
+    ``docs/agents/testing.md`` ("don't write change-detector tests").
+    """
+
+    def test_hy3_preview_context_length_is_256k_tier(self):
         from agent.model_metadata import get_model_context_length
         ctx = get_model_context_length("hy3-preview")
-        assert ctx == 256000
+        # Allow 256_000 (hardcoded) through 262_144 (upstream precise),
+        # plus a small slack for future precision tweaks. Anything below
+        # 200K means we lost the 256K registration entirely; anything
+        # above 300K means upstream silently re-tiered the model and we
+        # should look at the change.
+        assert 200_000 <= ctx <= 300_000, (
+            f"hy3-preview should be 256K-tier (~256_000–262_144), got {ctx}"
+        )
 
 
 # =============================================================================

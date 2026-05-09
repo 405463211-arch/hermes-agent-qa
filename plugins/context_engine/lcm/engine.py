@@ -43,6 +43,13 @@ logger = logging.getLogger(__name__)
 _LCM_MARKER_PREFIX = "[LCM INDEX]"
 _DEFAULT_TAIL_TOKEN_BUDGET_FRACTION = 0.20  # of threshold_tokens
 _DEFAULT_PROTECT_FIRST_N = 3
+
+# Bucket prefix used by ``MemoryStore._archive_oldest_to_lcm_locked`` so the
+# memory-archive chunks live alongside compression chunks in the same SQLite
+# store but in a separate session bucket.  ``lcm_search`` searches both so
+# overflowed MEMORY.md entries stay reachable. Must stay in sync with the
+# constant in ``tools/memory_tool.py``.
+_MEMORY_ARCHIVE_BUCKET_PREFIX = "memory:"
 _DEFAULT_PROTECT_LAST_N = 6
 
 
@@ -537,6 +544,17 @@ class LCMEngine(ContextEngine):
         self._embedder: Optional[Embedder] = embedder
         self._init_failed: Optional[str] = None
 
+        # Outcome of the most recent _compress() call. Status is one of:
+        #   "ok"                — at least one chunk indexed
+        #   "init_failed"       — _ensure_embedder/_ensure_store raised
+        #   "embed_failed"      — embedder.embed(...) raised
+        #   "store_add_failed"  — store.add(...) raised
+        #   "nothing_to_index"  — middle empty, or all redacted to ""
+        # Counters mirror ChunkStore.last_add_stats so run_agent can tell
+        # apart "embedder failed" from "dedup hit / nothing-to-index"
+        # instead of misreporting a 0-delta as a silent failure.
+        self._last_compress_status: Optional[Dict[str, Any]] = None
+
         # User-overridable embedder selection (read by _ensure_embedder).
         # Defaults preserve previous behaviour (all-MiniLM-L6-v2 if local
         # sentence-transformers is installed). Recommend BAAI/bge-m3 for
@@ -665,15 +683,21 @@ class LCMEngine(ContextEngine):
             {
                 "name": "lcm_search",
                 "description": (
-                    "Semantic search over earlier messages that were moved to "
-                    "the long-term memory store during context compression. "
-                    "Use this when you need details from earlier in the "
-                    "conversation that are no longer in your active context "
-                    "(referenced by a [LCM INDEX] marker). Returns the top-K "
-                    "matching chunks plus an optional window of neighbouring "
-                    "chunks for causal context; each result is tagged "
-                    "matched=true|false. Call lcm_recall with the IDs to "
-                    "read full content."
+                    "Semantic search over the long-term memory store, "
+                    "covering both (a) earlier messages moved during "
+                    "context compression (referenced by a [LCM INDEX] "
+                    "marker) and (b) MEMORY.md entries that overflowed "
+                    "and were auto-archived (look for role='memory_archive' "
+                    "in matches). Use this whenever you need details from "
+                    "earlier in the conversation or a previously remembered "
+                    "fact that no longer appears in the active context. "
+                    "Returns the top-K matching chunks plus an optional "
+                    "window of neighbouring chunks for causal context; "
+                    "each result is tagged matched=true|false. Response "
+                    "fields ``total_indexed`` (compression bucket) and "
+                    "``total_indexed_archive`` (memory archive bucket) "
+                    "report what's available. Call lcm_recall with the IDs "
+                    "to read full content."
                 ),
                 "parameters": {
                     "type": "object",
@@ -756,15 +780,44 @@ class LCMEngine(ContextEngine):
         store = self._ensure_store()
         embedder = self._ensure_embedder()
         query_emb = embedder.embed([query])[0]
-        # Embedder mismatch (different dim than what was stored) is silently
-        # filtered by store.search — fine, we just return whatever matches.
-        results = store.search(
-            self._session_id, query_emb, k=k, embedder_filter=embedder.name
+        # Search both the conversation-compression bucket and the
+        # memory-archive bucket (overflowed MEMORY.md entries land there
+        # via ``MemoryStore._archive_oldest_to_lcm_locked``).  Without this,
+        # ``Auto-archived to LCM`` notices would be misleading: the chunks
+        # exist but the agent could never retrieve them.
+        archive_session = (
+            f"{_MEMORY_ARCHIVE_BUCKET_PREFIX}{self._session_id}"
         )
-        # Fallback: if dim filter eliminated everything (e.g. embedder
-        # changed mid-session), retry without filter.
-        if not results:
-            results = store.search(self._session_id, query_emb, k=k)
+        buckets = (self._session_id, archive_session)
+
+        # Track which session bucket each result chunk was reached through
+        # so neighbour lookups (which require session_id) target the same
+        # bucket. ``chunk_bucket`` is keyed by chunk id for O(1) lookup.
+        chunk_bucket: Dict[int, str] = {}
+        merged: Dict[int, Dict[str, Any]] = {}
+        for bucket in buckets:
+            # Embedder mismatch (different dim than what was stored) is
+            # silently filtered by store.search — fine, we just return
+            # whatever matches.
+            bucket_hits = store.search(
+                bucket, query_emb, k=k, embedder_filter=embedder.name
+            )
+            # Fallback: if dim filter eliminated everything (e.g. embedder
+            # changed mid-session), retry without filter.
+            if not bucket_hits:
+                bucket_hits = store.search(bucket, query_emb, k=k)
+            for r in bucket_hits:
+                cid = int(r["id"])
+                if cid in merged:
+                    continue
+                merged[cid] = r
+                chunk_bucket[cid] = bucket
+
+        # Sort merged hits by score, then truncate to top-k so a query
+        # against both buckets doesn't return 2k results.
+        results = sorted(
+            merged.values(), key=lambda r: r["score"], reverse=True
+        )[:k]
 
         # Build the matched core first so we can annotate scores.
         matched_by_id: Dict[int, Dict[str, Any]] = {}
@@ -789,8 +842,10 @@ class LCMEngine(ContextEngine):
                 if cid not in ordered:
                     ordered[cid] = matched_by_id[cid]
                 continue
+            # Use the bucket each hit came from so memory-archive hits
+            # don't try to find neighbours in the conversation bucket.
             window = store.neighbors(
-                self._session_id, cid, before=neighbors, after=neighbors,
+                chunk_bucket[cid], cid, before=neighbors, after=neighbors,
             )
             for nb in window:
                 nb_id = int(nb["id"])
@@ -822,6 +877,9 @@ class LCMEngine(ContextEngine):
                 "neighbors_window": neighbors,
                 "embedder": embedder.name,
                 "total_indexed": store.session_chunk_count(self._session_id),
+                "total_indexed_archive": store.session_chunk_count(
+                    archive_session
+                ),
             },
             ensure_ascii=False,
         )
@@ -894,10 +952,26 @@ class LCMEngine(ContextEngine):
         )
 
         if compress_start >= compress_end:
+            self._last_compress_status = {
+                "status": "nothing_to_index",
+                "error": None,
+                "new": 0,
+                "reused": 0,
+                "already_attached": 0,
+                "input_chunks": 0,
+            }
             return messages
 
         middle = messages[compress_start:compress_end]
         if not middle:
+            self._last_compress_status = {
+                "status": "nothing_to_index",
+                "error": None,
+                "new": 0,
+                "reused": 0,
+                "already_attached": 0,
+                "input_chunks": 0,
+            }
             return messages
 
         # Embed middle messages
@@ -907,6 +981,14 @@ class LCMEngine(ContextEngine):
         except Exception as e:  # noqa: BLE001
             self._init_failed = str(e)
             logger.error("LCM init failed (%s) — falling back to passthrough", e)
+            self._last_compress_status = {
+                "status": "init_failed",
+                "error": str(e),
+                "new": 0,
+                "reused": 0,
+                "already_attached": 0,
+                "input_chunks": 0,
+            }
             return messages
 
         # Fine-grained chunking: each message is split into multiple
@@ -931,12 +1013,28 @@ class LCMEngine(ContextEngine):
                 searchable_texts.append(text)
 
         if not chunk_records:
+            self._last_compress_status = {
+                "status": "nothing_to_index",
+                "error": None,
+                "new": 0,
+                "reused": 0,
+                "already_attached": 0,
+                "input_chunks": 0,
+            }
             return messages
 
         try:
             embeddings = embedder.embed(searchable_texts)
         except Exception as e:  # noqa: BLE001
             logger.error("LCM embedding failed (%s) — falling back to passthrough", e)
+            self._last_compress_status = {
+                "status": "embed_failed",
+                "error": str(e),
+                "new": 0,
+                "reused": 0,
+                "already_attached": 0,
+                "input_chunks": len(chunk_records),
+            }
             return messages
 
         try:
@@ -945,7 +1043,29 @@ class LCMEngine(ContextEngine):
             )
         except Exception as e:  # noqa: BLE001
             logger.error("LCM store.add failed (%s) — falling back to passthrough", e)
+            self._last_compress_status = {
+                "status": "store_add_failed",
+                "error": str(e),
+                "new": 0,
+                "reused": 0,
+                "already_attached": 0,
+                "input_chunks": len(chunk_records),
+            }
             return messages
+
+        # Capture per-call dedup statistics from ChunkStore so the status
+        # we surface differentiates "+N truly new" from "0 new (all
+        # already indexed via dedup)" — without this the run_agent UI
+        # mis-reported the dedup case as an embedder failure.
+        _add_stats = getattr(store, "last_add_stats", None) or {}
+        self._last_compress_status = {
+            "status": "ok",
+            "error": None,
+            "new": int(_add_stats.get("new", len(new_ids))),
+            "reused": int(_add_stats.get("reused", 0)),
+            "already_attached": int(_add_stats.get("already_attached", 0)),
+            "input_chunks": int(_add_stats.get("input_chunks", len(chunk_records))),
+        }
 
         # Build the marker message that takes the middle's place
         keywords = _topic_keywords(searchable_texts)
@@ -1022,6 +1142,11 @@ class LCMEngine(ContextEngine):
                 base["lcm_indexed_chunks"] = -1
         if self._embedder is not None:
             base["lcm_embedder"] = self._embedder.name
+        # Surface the most-recent compression outcome so the run_agent UI
+        # can distinguish a real embedder failure from a 0-delta caused
+        # by dedup or fully-redacted middle content.
+        if self._last_compress_status is not None:
+            base["lcm_last_compress"] = dict(self._last_compress_status)
         return base
 
     # ------------------------------------------------------------------

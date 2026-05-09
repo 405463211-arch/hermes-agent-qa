@@ -9301,30 +9301,56 @@ class AIAgent:
                 if _engine_tag and callable(_get):
                     _stat = _get() or {}
                     _now_chunks = _stat.get("lcm_indexed_chunks")
-                    _prev = getattr(self, "_lcm_last_chunk_count", 0) or 0
+                    _last_comp = _stat.get("lcm_last_compress") or {}
+                    _status = _last_comp.get("status")
+                    _new = int(_last_comp.get("new") or 0)
+                    _reused = int(_last_comp.get("reused") or 0)
+                    _attached = int(_last_comp.get("already_attached") or 0)
+
+                    # Preferred path: engine surfaces an explicit status,
+                    # so we can tell a real embedder/store failure apart
+                    # from "0 new but all dedup-hit" or "nothing-to-index"
+                    # — those used to mis-report as "embedder failed".
+                    if _status in ("init_failed", "embed_failed", "store_add_failed"):
+                        _err = (_last_comp.get("error") or "unknown")
+                        if len(_err) > 120:
+                            _err = _err[:117] + "..."
+                        self._safe_print(
+                            f"  ⚠ LCM compression failed ({_status}): {_err}. "
+                            "See ~/.hermes/logs/agent.log."
+                        )
+                    elif _status == "ok" and _new > 0:
+                        _msg = f"  🧬 LCM: +{_new} chunk(s) indexed"
+                        if isinstance(_now_chunks, int) and _now_chunks >= 0:
+                            _msg += f" (session total: {_now_chunks})"
+                        self._safe_print(_msg)
+                    elif _status == "ok" and (_reused or _attached):
+                        # Dedup hit: chunks already existed (cross-session
+                        # reuse or same content already attached). This is
+                        # working-as-intended, not a failure.
+                        _hits = _reused + _attached
+                        self._safe_print(
+                            f"  🧬 LCM: 0 new ({_hits} already indexed via dedup)"
+                        )
+                    elif _status == "nothing_to_index":
+                        # Middle was empty or fully redacted — silent on
+                        # purpose, this is a non-event.
+                        pass
+                    elif _status is None:
+                        # Fallback for older engines that don't expose
+                        # lcm_last_compress: use the legacy delta-based
+                        # heuristic but only report POSITIVE delta — never
+                        # accuse the embedder based on 0-delta alone, since
+                        # that produced false alarms (this whole change).
+                        _prev = getattr(self, "_lcm_last_chunk_count", 0) or 0
+                        if isinstance(_now_chunks, int) and _now_chunks >= 0:
+                            _delta = max(0, _now_chunks - _prev)
+                            if _delta:
+                                self._safe_print(
+                                    f"  🧬 LCM: +{_delta} chunk(s) indexed "
+                                    f"(session total: {_now_chunks})"
+                                )
                     if isinstance(_now_chunks, int) and _now_chunks >= 0:
-                        _delta = max(0, _now_chunks - _prev)
-                        if _delta:
-                            self._safe_print(
-                                f"  🧬 LCM: +{_delta} chunk(s) indexed "
-                                f"(session total: {_now_chunks})"
-                            )
-                        elif (
-                            len(messages) > self.context_compressor.protect_first_n
-                                + self.context_compressor.protect_last_n + 1
-                        ):
-                            # LCM was invoked on a long-enough conversation
-                            # but added zero chunks — the embedder almost
-                            # certainly silently failed (MPS OOM, network
-                            # error, etc.) and the engine fell back to
-                            # passthrough.  Surface the hint loudly so the
-                            # user doesn't have to grep agent.log.
-                            self._safe_print(
-                                "  ⚠ LCM: 0 new chunks — embedder likely "
-                                "failed and fell back to passthrough. "
-                                "Check ~/.hermes/logs/agent.log for "
-                                "'LCM embedding failed' / 'LCM init failed'."
-                            )
                         self._lcm_last_chunk_count = _now_chunks
             except Exception:
                 pass

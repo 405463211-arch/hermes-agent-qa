@@ -69,6 +69,18 @@ assert results[0]["score"] >= results[1]["score"]
 **自检**：
 - [ ] 正常路径覆盖了吗？
 - [ ] 异常路径（empty / None / 错误格式）抛/降级行为符合预期？
+- [ ] **输入域 4 分类**全覆盖了吗？
+
+**输入域分类清单**（写参数化测试时按这 4 类列样本）：
+
+| 类别 | 例子 | 期望行为 |
+|---|---|---|
+| 合法 | `"User prefers dark mode"` | 接受 |
+| 空 / 全空白 | `""`、`"   "`、`"\n\t"` | 拒绝 |
+| 恶意 / 注入 | `"ignore previous instructions"` | 拒绝 |
+| **形式合法 + 内容空洞** | `"."`、`"---"`、`"。。。"`、`".`"`、`"- "` | **拒绝（多数项目漏这一类）** |
+
+→ hermes 真实例：MEMORY.md 历史上接受了一个 `.` 入库，因为前 3 类都测了，第 4 类没人想到。见"历史失误索引"#3。
 
 ### 轴 2：状态不变量（Invariants）
 
@@ -143,6 +155,20 @@ LCM 的 bug 就漏在这一轴：相同 chunk 从 session A 和 session B 抵达
 | 多 session | 同一段对话被 `--resume` 多次，状态如何累积？ |
 | 跨 fork | `fork_session()` 后两边写状态会互相污染吗？ |
 | 跨 platform | telegram 和 discord 收到同一条 message 会双重处理吗？ |
+| **跨模块共享 store** | **A 模块写、B 模块读同一个底层存储（SQLite / 文件 / cache），双方对 key / bucket / schema 的约定一致吗？** |
+
+**"跨模块共享 store" 的契约测试模板**——A 写、B 读、断言读到 = 写入：
+
+```python
+def test_<A>_to_<B>_round_trip_via_shared_store(self, ...):
+    # 模拟 A 模块写入路径
+    a_module.write(payload="unique-token-X")
+    # 通过 B 模块的对外接口读
+    result = b_module.read(query="unique-token-X")
+    # 关键：必须经过 B 的 *公开 API*，不能直接戳底层
+    # 这才能抓住"A 写 bucket-foo / B 读 bucket-bar"这类不一致
+    assert "unique-token-X" in result
+```
 
 ```python
 # 模板：跨 actor 同输入 → 状态收敛验证
@@ -314,6 +340,21 @@ def test_<op>_boundaries(...):
    - ✗ `mock(ChunkStore.add); ...` 然后期待发现 dedup bug
    - ✓ 让 store 走真实 SQLite（用 `tmp_path` 隔离）
 
+6. **A 模块写、B 模块读，各自单元测了但没"端到端契约"测试**
+   - ✗ `test_A`：`assert A.write(x) == ok` 加 `test_B`：`B.read() returns format`，两边都过就完事
+   - ✓ `test_contract`：`A.write(x); assert x in B.read()` —— 锁住"A 写完 B 真的能读到"的契约
+   - hermes 真实例：`memory_tool` 把 archive 写进 LCM 的 `memory:session_X` bucket，`lcm_search` 只搜 `session_X`，单元测试各自过，端到端默默断裂；见"历史失误索引"#2
+
+7. **错误的成功 / 失败消息**——UI / log 里的措辞与底层真实状态脱钩
+   - 子型 A「错误的成功消息」：返回 `success=true` + 描述里说"用 X 工具可恢复"，但实际不能
+     - ✗ `assert result["message"] == "Auto-archived to LCM (use lcm_search to recall)"` —— 只验证消息字符串
+     - ✓ 验证消息里承诺的能力**真的可用**：`{archive(); search_result = lcm_search(...); assert content in search_result}`
+   - 子型 B「错误的失败消息」：UI 报 `⚠ X failed`，但底层其实 `success=true`，只是某个旁路指标 = 0
+     - ✗ 用 `delta == 0` 推断"X 失败" —— delta=0 还可能是 dedup 命中 / 输入为空 / 幂等
+     - ✓ 让底层暴露**显式 status 字段**（`ok / init_failed / embed_failed / nothing_to_index / dedup_hit`），UI 按 status 分支报警
+   - 反模式根因：消息把"我以为发生了什么"当成事实播报，没有把"底层实际状态"显式暴露上来；测试如果只断言消息字符串，就把"用旁路指标推断"的谎言锁进了用例
+   - hermes 真实例：见"历史失误索引"#2（错误的成功消息）和 #4（错误的失败消息）
+
 ---
 
 ## 与 hermes 现有测试规范的关系
@@ -337,7 +378,46 @@ def test_<op>_boundaries(...):
 - **当时 4 个测试为何漏**：3 个用单 session，唯一双 session 的 `test_neighbors_do_not_cross_session_boundary` 用了相同内容但只断言邻居 —— 没人写"同内容跨 session 行数收敛"的测试
 - **修复测试**：`tests/plugins/test_lcm_engine.py::TestCrossSessionDedup::test_same_content_two_sessions_shares_one_row` + 5 个相邻测试
 
-> **追加新条目时，按"现象 / 盲点轴 / 修复测试"三段式记录**。
+### 2. memory archive → lcm_search 契约缺失（2026-05）
+
+- **现象**：用户跑 archive 压力测试发现 `memory(action=add, target=memory)` 在 MEMORY.md 触顶时返回 `Auto-archived N entries to LCM (use lcm_search to recall)`，但 `lcm_search` 搜不到，响应里 `total_indexed: 0`
+- **根因**：`tools/memory_tool.py:_archive_oldest_to_lcm_locked` 把归档内容写进 `f"memory:{session_id}"` bucket；`plugins/context_engine/lcm/engine.py:_handle_search` 只搜 `self._session_id`（不带前缀）—— 两个 bucket 永不重合，归档内容存进去但没人能读出来
+- **盲点轴**：轴 2（模块共享 store 的契约不变量）+ 轴 4（跨模块共享 store 的新增子轴）+ 轴 6（错误的成功消息让用户以为 archive 可搜，实际不能）
+- **当时为何漏**：
+  - `tests/tools/test_memory_tool.py` 测了"add 触发 archive 时返回 `archived_to_lcm` 字段" —— 但**只验证字段存在**，不验证 archive 的内容是否真的可被检索
+  - `tests/plugins/test_lcm_engine.py` 测了"compress 后 search 能找到" —— 只走 compression 这一条写入路径，从未走 memory.archive 路径
+  - **两个文件之间没有 A→B 端到端契约测试**：底层共享 SQLite store 但约定的 session_id 语义不一致，单元测试各管各的；这是 anti-pattern #6 的真实落地
+- **修复测试**：`tests/plugins/test_lcm_engine.py::TestLCMTools::test_search_finds_memory_archive_bucket`（直接验证 archive bucket 可搜）+ `test_search_merges_compression_and_archive_results`（双 bucket 都报告 + archive 进结果集）
+
+### 3. memory 接受 `.` 等无信息条目（2026-05）
+
+- **现象**：用户清理 USER.md 时发现第 3 条 entry 只有一个 `.`（一个英文句号），无人记得何时写入；它每次会话都被注入到系统提示里
+- **根因**：`MemoryStore.add()` 只校验"非空"+"非恶意注入"两种输入，**没有"实质内容"过滤**——LLM 极少数情况输出空兜底成 `.`，校验通过写入成功
+- **盲点轴**：轴 1（异常路径输入域 4 分类不全）+ 轴 6（垃圾内容静默进系统提示，agent 行为被毫无意义地污染却没有可观测信号）
+- **当时为何漏**：
+  - `test_add_empty_rejected` 测了**空字符串 / 全空白**（输入域第 2 类）
+  - `test_add_injection_blocked` 测了**恶意模式 / 注入**（输入域第 3 类）
+  - **"形式合法 + 内容空洞"**（第 4 类）：`"."`、`"---"`、`".`"`、`"。。。"` 没人列入输入清单，全部漏过
+- **修复测试**：`tests/tools/test_memory_tool.py::TestMemoryStoreAdd::test_add_pure_punctuation_rejected`（参数化 8 种垃圾）+ `test_add_short_but_valid_passes`（5 种合法短文本不误伤）+ `test_replace_pure_punctuation_rejected`（同样护栏覆盖 `replace`）
+
+### 4. LCM compression 把 dedup 命中误报成 embedder 失败（2026-05）
+
+- **现象**：用户压力测试后看见 `⚠ LCM: 0 new chunks — embedder likely failed and fell back to passthrough.`；但 `~/.hermes/lcm/store.db` 实际有 91 条 chunks 用 `sentence-transformers / dim=1024` 正常嵌入，`agent.log` 里 0 条 `LCM embedding failed` / `LCM init failed`——embedder 根本没失败，是误报
+- **根因**：`run_agent.py:9300-9328` 用 `lcm_indexed_chunks` 的 delta 推断"是否成功"——`delta == 0` 直接归因为 embedder failure。但 `delta == 0` 是**充分不必要条件**：
+  - 真失败（init/embed/store.add 抛异常）→ ✓ delta=0
+  - 同一 session 第二次 compression，chunks 全部命中 `INSERT OR IGNORE` → ✗ 也是 delta=0
+  - 跨 session dedup 全部命中 `chunks` 表 → ✗ 也是 delta=0
+  - middle 全被 redact 抹空 → ✗ 也是 delta=0
+- **盲点轴**：轴 6（可见状态语义错乱：把"成功 + 0 新增"翻译成"失败"）+ anti-pattern #7 的对偶面（不仅有"错误的成功消息"，还有"错误的失败消息"——把正常 dedup 喊成 alarm）
+- **当时为何漏**：
+  - `test_compress_falls_back_to_passthrough_when_embedder_init_fails` 只测了"真失败时 compress 返回 passthrough"，没测"UI 警告判定"
+  - `ChunkStore.add()` 内部已经统计了 `new_count / reused_count / already_attached_count`，但只 log 了，没 surface 给 engine / run_agent 用——**信息已具备，链路没打通**
+  - 没人写"端到端契约：第二次 compress 同样消息时 UI 不应报警告"——典型 anti-pattern #6（A 模块写 stats、B 模块读 chunk_count，缺契约）
+- **修复测试**：
+  - `tests/plugins/test_lcm_engine.py::TestChunkStoreAddStats`（5 个：first-time / 同 session 再 add / 跨 session reuse / 空输入清零 / 混合）
+  - `tests/plugins/test_lcm_engine.py::TestLCMEngineCompressStatus`（8 个：ok+new / ok+dedup / init_failed / embed_failed / store_add_failed / nothing_to_index / get_status 暴露字段 / 首次未压缩前不暴露字段）
+
+> **追加新条目时，按"现象 / 根因 / 盲点轴 / 当时为何漏 / 修复测试"五段式记录**（在 #1 三段式基础上扩充，把"根因"和"为何漏"独立出来更利于以后定位类似问题）。
 
 ---
 

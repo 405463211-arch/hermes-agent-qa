@@ -120,6 +120,16 @@ class ChunkStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA)
         self._lock = threading.RLock()
+        # Per-write dedup statistics from the most recent ``add()`` call.
+        # The engine reads this to surface accurate "+N indexed / N reused
+        # / 0 new (dedup hit)" status, so the user can tell apart a real
+        # embedder failure from the "second compression on the same
+        # messages" / "cross-session content already stored" cases.
+        # Keys: new (int), reused (int, hit on existing chunks attached
+        # via INSERT in chunk_sessions), already_attached (int, both
+        # chunk and chunk_sessions row already existed → INSERT OR IGNORE
+        # no-op), input_chunks (int, total inputs).
+        self.last_add_stats: Optional[Dict[str, int]] = None
         self._migrate_legacy()
 
     # ------------------------------------------------------------------
@@ -228,8 +238,19 @@ class ChunkStore:
 
         Returns the chunk IDs (one per input chunk) in input order — IDs
         may belong to rows that pre-dated this call when dedup hit.
+
+        Side effect: populates ``self.last_add_stats`` with
+        ``{"new", "reused", "already_attached", "input_chunks"}`` so the
+        engine can surface dedup-vs-truly-new accurately to the user
+        instead of mis-reporting a 0-delta as an "embedder failure".
         """
         if not chunks:
+            self.last_add_stats = {
+                "new": 0,
+                "reused": 0,
+                "already_attached": 0,
+                "input_chunks": 0,
+            }
             return []
         if len(chunks) != embeddings.shape[0]:
             raise ValueError(
@@ -331,6 +352,12 @@ class ChunkStore:
                 "already_in_session=%d",
                 session_id, new_count, reused_count, already_attached_count,
             )
+        self.last_add_stats = {
+            "new": new_count,
+            "reused": reused_count,
+            "already_attached": already_attached_count,
+            "input_chunks": len(chunks),
+        }
         return ids
 
     # ------------------------------------------------------------------

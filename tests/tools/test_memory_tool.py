@@ -153,6 +153,37 @@ class TestMemoryStoreAdd:
         assert result["success"] is False
         assert "Blocked" in result["error"]
 
+    @pytest.mark.parametrize(
+        "junk",
+        [".", "..", ".`", "---", "。", "。。。", "?!", "  -  "],
+    )
+    def test_add_pure_punctuation_rejected(self, store, junk):
+        """Regression: production USER.md was discovered with a single '.'
+        entry. ``add`` must reject entries that lack at least three
+        substantive (alnum / CJK) characters so junk like that can't enter
+        the system prompt."""
+        result = store.add("memory", junk)
+        assert result["success"] is False
+        assert "substantive" in result["error"].lower()
+
+    @pytest.mark.parametrize(
+        "valid",
+        ["Lefty", "我习惯", "abc", "Use TZ=UTC.", "三个字"],
+    )
+    def test_add_short_but_valid_passes(self, store, valid):
+        """The substantive-char gate must not break short legitimate
+        entries like ``Lefty`` or short Chinese phrases."""
+        result = store.add("memory", valid)
+        assert result["success"] is True
+
+    def test_replace_pure_punctuation_rejected(self, store):
+        """Same gate must apply to ``replace`` so callers can't sneak
+        junk past via a different action."""
+        store.add("memory", "Python 3.11 project")
+        result = store.replace("memory", "Python", "..")
+        assert result["success"] is False
+        assert "substantive" in result["error"].lower()
+
 
 class TestMemoryStoreReplace:
     def test_replace_entry(self, store):

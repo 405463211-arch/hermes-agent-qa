@@ -367,6 +367,112 @@ class TestLCMTools:
         result = json.loads(eng.handle_tool_call("lcm_search", {"query": "  "}))
         assert "error" in result
 
+    def test_search_finds_memory_archive_bucket(self, tmp_path):
+        """Regression: ``MemoryStore._archive_oldest_to_lcm_locked`` writes
+        overflowed MEMORY.md entries into the bucket
+        ``"memory:" + session_id`` so they're segregated from compression
+        chunks. The previous ``lcm_search`` only looked at the bare
+        session bucket, which made the ``Auto-archived to LCM`` notice
+        misleading: chunks existed but the agent could never retrieve
+        them. ``_handle_search`` now searches both buckets — verify by
+        seeding the archive bucket directly and checking the chunk
+        comes back through the tool surface.
+        """
+        eng = _make_engine(tmp_path)
+        store = eng._ensure_store()
+        embedder = eng._ensure_embedder()
+
+        archived_text = (
+            "占位记忆条目 archived-token-7 关于 ssh StrictHostKeyChecking 配置"
+        )
+        emb_array = embedder.embed([archived_text])
+        store.add(
+            session_id=f"memory:{eng._session_id}",
+            chunks=[{
+                "role": "memory_archive",
+                "content": archived_text,
+                "chunk_type": "memory_archive",
+            }],
+            embeddings=emb_array,
+            embedder_name=embedder.name,
+        )
+
+        result = json.loads(
+            eng.handle_tool_call(
+                "lcm_search",
+                {"query": "archived-token-7 ssh", "k": 3, "neighbors": 0},
+            )
+        )
+
+        # The tool now reports both buckets.
+        assert result.get("total_indexed") == 0
+        assert result.get("total_indexed_archive") == 1
+
+        # And the archived entry is reachable.
+        matched = [m for m in result.get("matches", []) if m.get("matched")]
+        assert matched, f"archived chunk not retrieved: {result!r}"
+        assert matched[0]["role"] == "memory_archive"
+        assert "archived-token-7" in matched[0]["preview"]
+
+    def test_search_merges_compression_and_archive_results(self, tmp_path):
+        """Both buckets' content must be visible to lcm_search.
+
+        Pre-fix: only the bare ``self._session_id`` bucket was searched, so
+        archive chunks were entirely invisible. The contract we lock in
+        here is "results from both buckets reach the agent" — the actual
+        score ordering depends on the embedder (LexicalEmbedder is word-
+        bag hashing, so we don't assert on score ranking which would make
+        this a flaky change-detector test).
+        """
+        eng = _make_engine(tmp_path)
+
+        # Seed compression bucket via the normal compress path
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(20):
+            role = "user" if i % 2 == 0 else "assistant"
+            msgs.append({
+                "role": role,
+                "content": f"compression-bucket-token-{i} weather discussion",
+            })
+        eng.compress(msgs, current_tokens=10000)
+
+        # Seed archive bucket with the unique query tokens
+        store = eng._ensure_store()
+        embedder = eng._ensure_embedder()
+        target_text = "archive-bucket-token alpha bravo charlie precise match"
+        store.add(
+            session_id=f"memory:{eng._session_id}",
+            chunks=[{
+                "role": "memory_archive",
+                "content": target_text,
+                "chunk_type": "memory_archive",
+            }],
+            embeddings=embedder.embed([target_text]),
+            embedder_name=embedder.name,
+        )
+
+        result = json.loads(
+            eng.handle_tool_call(
+                "lcm_search",
+                {"query": "archive-bucket-token alpha", "k": 10, "neighbors": 0},
+            )
+        )
+
+        # Both bucket counts surface
+        assert result.get("total_indexed_archive") == 1
+        assert result.get("total_indexed", 0) > 0  # compression seeded chunks too
+
+        # Critical contract: the archive chunk is reachable; pre-fix it
+        # would never appear in matches at all.
+        archive_hits = [
+            m for m in result.get("matches", [])
+            if m.get("matched") and m.get("role") == "memory_archive"
+        ]
+        assert archive_hits, (
+            f"archive chunk missing from cross-bucket results: {result!r}"
+        )
+        assert "archive-bucket-token" in archive_hits[0]["preview"]
+
     def test_recall_with_invalid_ids_returns_error(self, tmp_path):
         eng = _make_engine(tmp_path)
         result = json.loads(
@@ -1224,3 +1330,246 @@ class TestLegacyMigration:
         assert row_count == 3
         # But the new session is now ATTACHED to the legacy chunk.
         assert store.session_chunk_count("fresh-session") == 1
+
+
+# ---------------------------------------------------------------------------
+# ChunkStore.last_add_stats — dedup vs new accounting (Scheme A)
+# ---------------------------------------------------------------------------
+
+
+class TestChunkStoreAddStats:
+    """Verify ``ChunkStore.add()`` exposes accurate per-call dedup stats.
+
+    Why this matters: ``run_agent.py`` used to mis-report a 0-delta in
+    ``session_chunk_count`` as an embedder failure (false alarm).  The
+    fix surfaces ``store.last_add_stats`` so the engine — and ultimately
+    the user-facing ``+N indexed`` line — can tell apart "all hits were
+    dedup" from "embedder actually failed".
+    """
+
+    def _store(self, tmp_path: Path) -> ChunkStore:
+        return ChunkStore(tmp_path / "lcm" / "store.db")
+
+    def test_first_time_insert_records_new_count(self, tmp_path):
+        store = self._store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        chunks = [
+            {"role": "user", "content": "alpha"},
+            {"role": "assistant", "content": "beta"},
+        ]
+        store.add("S", chunks, emb.embed(["alpha", "beta"]), "lex")
+
+        assert store.last_add_stats == {
+            "new": 2, "reused": 0, "already_attached": 0, "input_chunks": 2,
+        }
+
+    def test_same_session_re_add_records_already_attached(self, tmp_path):
+        """When the same session adds the same content twice, the second
+        call should report ``already_attached`` (INSERT OR IGNORE no-ops)
+        — this is the *exact* path that caused the false-alarm warning
+        in production: a re-run of compression on overlapping messages."""
+        store = self._store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        chunks = [{"role": "user", "content": "same content"}]
+
+        store.add("S", chunks, emb.embed(["same content"]), "lex")
+        assert store.last_add_stats["new"] == 1
+
+        store.add("S", chunks, emb.embed(["same content"]), "lex")
+        assert store.last_add_stats == {
+            "new": 0, "reused": 0, "already_attached": 1, "input_chunks": 1,
+        }
+
+    def test_cross_session_dedup_records_reused(self, tmp_path):
+        """Same content under a different session_id should reuse the
+        existing chunk row (cross-session dedup) and report it as
+        ``reused`` — neither a "new" nor a "real failure"."""
+        store = self._store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        chunks = [{"role": "user", "content": "shared content"}]
+
+        store.add("session-A", chunks, emb.embed(["shared content"]), "lex")
+        store.add("session-B", chunks, emb.embed(["shared content"]), "lex")
+
+        assert store.last_add_stats == {
+            "new": 0, "reused": 1, "already_attached": 0, "input_chunks": 1,
+        }
+
+    def test_empty_input_clears_stats_to_zero(self, tmp_path):
+        """Empty add() must still populate stats so the engine never
+        sees a stale ``last_add_stats`` from a previous call."""
+        store = self._store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        store.add("S", [{"role": "user", "content": "x"}], emb.embed(["x"]), "lex")
+        assert store.last_add_stats["new"] == 1
+
+        store.add("S", [], np.zeros((0, 64), dtype=np.float32), "lex")
+        assert store.last_add_stats == {
+            "new": 0, "reused": 0, "already_attached": 0, "input_chunks": 0,
+        }
+
+    def test_mixed_input_breaks_down_correctly(self, tmp_path):
+        """A single add() with a mix of (truly new + dedup-hit) content
+        must report each bucket independently — not collapse them."""
+        store = self._store(tmp_path)
+        emb = LexicalEmbedder(dim=64)
+        # Pre-seed: chunk that will be dedup-hit on the second batch.
+        store.add(
+            "S", [{"role": "user", "content": "preexisting"}],
+            emb.embed(["preexisting"]), "lex",
+        )
+
+        # Second batch: 1 already-attached + 2 truly new.
+        chunks = [
+            {"role": "user", "content": "preexisting"},  # dedup hit
+            {"role": "assistant", "content": "fresh-1"},
+            {"role": "user", "content": "fresh-2"},
+        ]
+        store.add(
+            "S", chunks,
+            emb.embed(["preexisting", "fresh-1", "fresh-2"]), "lex",
+        )
+
+        assert store.last_add_stats == {
+            "new": 2, "reused": 0, "already_attached": 1, "input_chunks": 3,
+        }
+
+
+# ---------------------------------------------------------------------------
+# LCMEngine._last_compress_status — surface-level contract (Scheme A)
+# ---------------------------------------------------------------------------
+
+
+class TestLCMEngineCompressStatus:
+    """The engine must expose an unambiguous status for the most-recent
+    compression so ``run_agent.py`` can distinguish *real* failure from
+    *dedup-hit* / *nothing-to-index* — the previous logic mis-reported
+    all 0-delta cases as ``⚠ embedder likely failed``.
+    """
+
+    def _bulk_msgs(self, tag: str, n: int = 25):
+        msgs = [{"role": "system", "content": "sys"}]
+        long_chunk = "x " * 200
+        for i in range(n):
+            role = "user" if i % 2 == 0 else "assistant"
+            msgs.append({"role": role, "content": f"{tag}-{i} {long_chunk}"})
+        return msgs
+
+    def test_status_ok_with_new_count_on_first_compress(self, tmp_path):
+        eng = _make_engine(tmp_path)
+        eng.compress(self._bulk_msgs("first"), current_tokens=10000)
+        st = eng._last_compress_status
+        assert st is not None
+        assert st["status"] == "ok"
+        assert st["error"] is None
+        assert st["new"] > 0
+        assert st["reused"] == 0
+        assert st["already_attached"] == 0
+
+    def test_status_ok_with_dedup_on_second_compress_same_messages(
+        self, tmp_path
+    ):
+        """The bug we are fixing: identical messages compressed twice.
+        First run = ``new>0``; second run = ``new==0`` and
+        ``already_attached>0``.  Crucially, status must still be ``ok``
+        — NOT a failure."""
+        eng = _make_engine(tmp_path)
+        msgs = self._bulk_msgs("dup")
+        eng.compress(msgs, current_tokens=10000)
+        first_new = eng._last_compress_status["new"]
+        assert first_new > 0
+
+        eng.compress(msgs, current_tokens=10000)
+        st = eng._last_compress_status
+        assert st["status"] == "ok"
+        assert st["error"] is None
+        assert st["new"] == 0
+        assert st["already_attached"] >= first_new
+
+    def test_status_init_failed_when_ensure_embedder_raises(
+        self, tmp_path, monkeypatch
+    ):
+        eng = _make_engine(tmp_path)
+        eng._embedder = None
+        eng._store = None
+        monkeypatch.setattr(
+            eng, "_ensure_embedder",
+            lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        eng.compress(self._bulk_msgs("init"), current_tokens=10000)
+        st = eng._last_compress_status
+        assert st["status"] == "init_failed"
+        assert "boom" in (st["error"] or "")
+        assert st["new"] == 0
+
+    def test_status_embed_failed_when_embedder_embed_raises(
+        self, tmp_path, monkeypatch
+    ):
+        eng = _make_engine(tmp_path)
+        eng._ensure_store()
+        embedder = eng._ensure_embedder()
+        monkeypatch.setattr(
+            embedder, "embed",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("embed-go-boom")),
+        )
+        eng.compress(self._bulk_msgs("embed"), current_tokens=10000)
+        st = eng._last_compress_status
+        assert st["status"] == "embed_failed"
+        assert "embed-go-boom" in (st["error"] or "")
+        assert st["new"] == 0
+
+    def test_status_store_add_failed_when_store_add_raises(
+        self, tmp_path, monkeypatch
+    ):
+        eng = _make_engine(tmp_path)
+        store = eng._ensure_store()
+        eng._ensure_embedder()
+        monkeypatch.setattr(
+            store, "add",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("store-broken")),
+        )
+        eng.compress(self._bulk_msgs("storefail"), current_tokens=10000)
+        st = eng._last_compress_status
+        assert st["status"] == "store_add_failed"
+        assert "store-broken" in (st["error"] or "")
+        assert st["new"] == 0
+
+    def test_status_nothing_to_index_when_middle_redacts_to_empty(
+        self, tmp_path, monkeypatch
+    ):
+        """If every middle chunk's content is redacted to empty text,
+        ``chunk_records`` ends up empty and we should report
+        ``nothing_to_index`` — not a failure."""
+        eng = _make_engine(tmp_path)
+        # Force the redactor to return empty strings for everything.
+        monkeypatch.setattr(
+            "plugins.context_engine.lcm.engine.redact_sensitive_text",
+            lambda text, **kw: "",
+        )
+        eng.compress(self._bulk_msgs("redact"), current_tokens=10000)
+        st = eng._last_compress_status
+        assert st["status"] == "nothing_to_index"
+        assert st["error"] is None
+        assert st["new"] == 0
+
+    def test_get_status_exposes_lcm_last_compress(self, tmp_path):
+        """End-to-end contract: the fields the UI reads are present."""
+        eng = _make_engine(tmp_path)
+        eng.compress(self._bulk_msgs("status"), current_tokens=10000)
+        public = eng.get_status()
+        assert "lcm_last_compress" in public
+        snap = public["lcm_last_compress"]
+        for key in ("status", "error", "new", "reused",
+                    "already_attached", "input_chunks"):
+            assert key in snap, f"missing '{key}' in lcm_last_compress"
+        assert snap["status"] == "ok"
+
+    def test_get_status_omits_lcm_last_compress_before_first_compress(
+        self, tmp_path
+    ):
+        """A fresh engine that never compressed should not advertise a
+        stale ``lcm_last_compress`` — the field is opt-in once we have
+        something to report."""
+        eng = _make_engine(tmp_path)
+        public = eng.get_status()
+        assert "lcm_last_compress" not in public
