@@ -54,7 +54,7 @@
 | **L1** | rapidocr / PaddleOCR **精确匹配**（exact / contains / regex / near_text / char_offset） | 文本可见 + 字体清晰 ~80% 场景 | 0 |
 | **L2** | OCR + **region 区域限定** | 已知元素在屏幕某区块 | 0 |
 | **L3** | **ShowUI-2B 本地 grounding** + OmniParser snap | 图标 / 无文本按钮，本地推理 70% 准 | 0 |
-| **L4** | 云端 **qwen3-vl-flash** + bbox_2d 归一化 + scipy 像素吸附 | 全新页面 / 复杂语义定位 | 1 次 VLM call |
+| **L4** | 云端 **qwen3.6-plus** + bbox_2d 归一化 + scipy 像素吸附 | 全新页面 / 复杂语义定位 | 1 次 VLM call |
 | **L5** | **keypad yaml 缓存** | 数字键盘 / 固定布局键盘 | 0 |
 
 ### 2.2 OCR 引擎（`ocr_engine.py`）
@@ -68,7 +68,7 @@
 历史教训：v1 让 VLM 直接返回像素坐标，对 1080×2400 这种屏幕偏移高达 1194 像素 → v3 强制归一化协议：
 
 ```
-qwen3-vl-flash system prompt 强制要求 bbox_2d 在 [0, 1000] 区间内
+qwen3.6-plus system prompt 强制要求 bbox_2d 在 [0, 1000] 区间内（沿用 qwen-vl 官方 grounding 训练协议）
 ↓ from_json 解析
 ↓ 用真实 image_dims 反算回像素
 ↓ scipy 连通域吸附（±80px 窗口）
@@ -102,7 +102,7 @@ VLM 给的坐标常落在按钮边缘外 5-30 像素，吸附逻辑：
 4. 把 VL 坐标"吸"到该质心 → 真实可点击点
 ```
 
-**为什么 hermes 需要这层**：qwen3-vl-flash 是 7B-class 模型，定位精度 ±20px；吸附把它拉回到真实 UI 元素的几何中心，点击成功率从 ~70% 提到 ~95%。
+**为什么 hermes 需要这层**：VLM 给的 bbox 中心常落在按钮边缘外 5-30 像素（训练数据用归一化坐标 + UI 元素边界感弱）；吸附把坐标拉回到连通域几何中心 → 真实可点击位置。历史实测（qwen3-vl-flash 时代）：点击成功率从 ~70% 提到 ~95%；现已升级到 **qwen3.6-plus**（MoE 397B-A17B），定位精度本身有提升，但吸附仍保留为最后一道几何兜底层（小图标 / 非文本按钮的边界框预测仍非完美）。
 
 ### 2.6 lazy_upgrader 自演进（`lazy_upgrader.py`）
 
