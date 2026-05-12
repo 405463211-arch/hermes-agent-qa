@@ -8699,6 +8699,102 @@ def main():
         ),
     )
 
+    _hk_new = hooks_subparsers.add_parser(
+        "new",
+        help=(
+            "Scaffold a new shell hook from a starter template: copies the "
+            "script into ~/.hermes/agent-hooks/, patches ~/.hermes/config.yaml, "
+            "and runs `hermes hooks doctor`"
+        ),
+    )
+    _hk_new.add_argument(
+        "--from-template", dest="from_template", default=None,
+        help=(
+            "Starter template name (e.g. block-rm-rf, block-env-write, "
+            "block-force-push-main, auto-format, auto-stage-on-write, "
+            "inject-cwd-context). Omit for interactive selection."
+        ),
+    )
+    _hk_new.add_argument(
+        "--name", default=None,
+        help=(
+            "Override the destination script filename (without .sh). "
+            "Defaults to the template name."
+        ),
+    )
+    _hk_new.add_argument(
+        "--event", default=None,
+        help=(
+            "Hook event (only needed when --from-template is omitted in "
+            "non-interactive mode)."
+        ),
+    )
+    _hk_new.add_argument(
+        "--matcher", default=None,
+        help=(
+            "Tool-name regex for pre_tool_call / post_tool_call. Overrides "
+            "the template default. Ignored for other events."
+        ),
+    )
+    _hk_new.add_argument(
+        "--timeout", type=int, default=None,
+        help="Per-hook timeout in seconds (1-300). Defaults to 60.",
+    )
+    _hk_new.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be written without touching disk.",
+    )
+    _hk_new.add_argument(
+        "--non-interactive", action="store_true",
+        help=(
+            "Skip every prompt. Requires --from-template (or --event), "
+            "and answers 'yes' to the config-patch question. Useful for CI."
+        ),
+    )
+
+    _hk_suggest = hooks_subparsers.add_parser(
+        "suggest",
+        help=(
+            "Mine recent session histories for repeated tool calls and "
+            "propose hook candidates (deterministic patterns + optional "
+            "LLM rationale)"
+        ),
+    )
+    _hk_suggest.add_argument(
+        "--lookback-hours", type=int, default=24,
+        help="How far back to look in ~/.hermes/sessions/ (default: 24).",
+    )
+    _hk_suggest.add_argument(
+        "--threshold", type=int, default=3,
+        help="Minimum repetitions to flag as a candidate (default: 3).",
+    )
+    _hk_suggest.add_argument(
+        "--top", type=int, default=10,
+        help="Maximum candidates to display (default: 10).",
+    )
+    _hk_suggest.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Emit machine-readable JSON instead of the human menu.",
+    )
+    _hk_suggest.add_argument(
+        "--with-llm", action="store_true",
+        help=(
+            "Ask the configured LLM (auxiliary `session_search` task) to "
+            "rank candidates and suggest concrete matcher regexes + a "
+            "one-line rationale. 90s wall timeout; on timeout falls back "
+            "silently to frequency-only output. Otherwise candidates are "
+            "returned purely from frequency analysis."
+        ),
+    )
+    _hk_suggest.add_argument(
+        "--include-all", dest="include_all", action="store_true",
+        help=(
+            "Also surface observation tools (read_file, memory, todo, ...) "
+            "and shell navigation verbs (cd, ls, ...). Off by default since "
+            "their high call counts crowd out actionable patterns."
+        ),
+    )
+
     hooks_parser.set_defaults(func=cmd_hooks)
 
     # =========================================================================

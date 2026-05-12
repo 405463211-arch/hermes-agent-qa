@@ -6,6 +6,8 @@ Usage::
     hermes hooks test <event> [--for-tool X] [--payload-file F]
     hermes hooks revoke <command>
     hermes hooks doctor
+    hermes hooks new [--from-template NAME] [--dry-run] [--non-interactive]
+    hermes hooks suggest [--lookback-hours N] [--threshold N] [--with-llm]
 
 Consent records live under ``~/.hermes/shell-hooks-allowlist.json`` and
 hook definitions come from the ``hooks:`` block in ``~/.hermes/config.yaml``
@@ -13,7 +15,8 @@ hook definitions come from the ``hooks:`` block in ``~/.hermes/config.yaml``
 
 This module is a thin CLI shell over :mod:`agent.shell_hooks`; every
 shared concern (payload serialisation, response parsing, allowlist
-format) lives there.
+format) lives there. ``new`` and ``suggest`` are split into sibling
+modules so this file stays the dispatcher.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ def hooks_command(args) -> None:
     sub = getattr(args, "hooks_action", None)
 
     if not sub:
-        print("Usage: hermes hooks {list|test|revoke|doctor}")
+        print("Usage: hermes hooks {list|test|revoke|doctor|new|suggest}")
         print("Run 'hermes hooks --help' for details.")
         return
 
@@ -40,6 +43,12 @@ def hooks_command(args) -> None:
         _cmd_revoke(args)
     elif sub == "doctor":
         _cmd_doctor(args)
+    elif sub == "new":
+        from hermes_cli.hooks_new import run_new
+        run_new(args)
+    elif sub == "suggest":
+        from hermes_cli.hooks_suggest import run_suggest
+        run_suggest(args)
     else:
         print(f"Unknown hooks subcommand: {sub}")
 

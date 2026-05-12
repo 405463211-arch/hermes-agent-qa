@@ -1166,6 +1166,25 @@ class AIAgent:
         self._pending_steer: Optional[str] = None
         self._pending_steer_lock = threading.Lock()
 
+        # Hook-suggestion auto-detector — counts repeated tool fingerprints
+        # in this session and, on threshold crossing, queues a one-shot
+        # system reminder for injection into the next tool result. Reuses
+        # the deterministic fingerprinting from `hermes hooks suggest`, so
+        # in-session and offline analysis stay aligned. Off-switch:
+        # `display.hook_suggestions: off` in ~/.hermes/config.yaml.
+        try:
+            from agent.hook_hinter import HookHinter
+            from hermes_cli.config import load_config
+            _cfg = load_config() or {}
+            _display = _cfg.get("display") or {}
+            _hh_enabled = _display.get("hook_suggestions", True)
+            _hh_threshold = int(_display.get("hook_suggestions_threshold", 3))
+            self.hook_hinter = HookHinter(
+                threshold=_hh_threshold, enabled=bool(_hh_enabled),
+            )
+        except Exception:
+            self.hook_hinter = None
+
         # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
         # runs each tool on its own ThreadPoolExecutor worker — those worker
         # threads have tids distinct from `_execution_thread_id`, so
@@ -10004,6 +10023,15 @@ class AIAgent:
             # result so the steer lands as early as possible.
             self._apply_pending_steer_to_tool_results(messages, 1)
 
+            # Record successful tool dispatch for in-session hook detection
+            # (concurrent path). `is_error` may be undefined when r is None
+            # (cancellation) — treat those as failures.
+            if r is not None and not is_error and getattr(self, "hook_hinter", None) is not None:
+                try:
+                    self.hook_hinter.record(name, args)
+                except Exception as hh_err:
+                    logger.debug(f"hook_hinter.record skipped: {hh_err}")
+
         # ── Per-turn aggregate budget enforcement ─────────────────────────
         num_tools = len(parsed_calls)
         if num_tools > 0:
@@ -10016,6 +10044,20 @@ class AIAgent:
         # so the steer marker is never truncated. See steer() for details.
         if num_tools > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools)
+
+        # ── Hook-suggestion hint injection ────────────────────────────────
+        # If the in-session counter just crossed the threshold for one or
+        # more tool fingerprints, append a one-shot reminder to the same
+        # tail tool result. Same delivery channel as /steer, so prompt
+        # caching invariants are preserved (only the tail message changes).
+        if num_tools > 0 and getattr(self, "hook_hinter", None) is not None:
+            try:
+                from agent.hook_hinter import apply_pending_hints_to_tool_results
+                apply_pending_hints_to_tool_results(
+                    self.hook_hinter, messages, num_tools,
+                )
+            except Exception as hh_err:
+                logger.debug(f"hook_hinter injection skipped: {hh_err}")
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
@@ -10393,6 +10435,15 @@ class AIAgent:
             # entire batch.  The model sees it on the next API iteration.
             self._apply_pending_steer_to_tool_results(messages, 1)
 
+            # Record successful tool dispatch for in-session hook detection.
+            # Errors/blocked calls are deliberately not recorded — we only
+            # want to flag patterns that are consistently *succeeding*.
+            if not _is_error_result and getattr(self, "hook_hinter", None) is not None:
+                try:
+                    self.hook_hinter.record(function_name, function_args)
+                except Exception as hh_err:
+                    logger.debug(f"hook_hinter.record skipped: {hh_err}")
+
             if not self.quiet_mode:
                 if self.verbose_logging:
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -10427,6 +10478,19 @@ class AIAgent:
         # applied to sequential execution as well.
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+
+        # ── Hook-suggestion hint injection (sequential path) ──────────────
+        # Mirrors the concurrent path. Threshold-crossing fingerprints are
+        # queued by hook_hinter.record() inside the per-tool loop; this is
+        # the single drain point per batch.
+        if num_tools_seq > 0 and getattr(self, "hook_hinter", None) is not None:
+            try:
+                from agent.hook_hinter import apply_pending_hints_to_tool_results
+                apply_pending_hints_to_tool_results(
+                    self.hook_hinter, messages, num_tools_seq,
+                )
+            except Exception as hh_err:
+                logger.debug(f"hook_hinter injection skipped: {hh_err}")
 
 
 

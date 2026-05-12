@@ -850,6 +850,17 @@ display:
   #   false: Only send the final response
   interim_assistant_messages: true
 
+  # In-session "you keep doing X — should we make it a hook?" reminders.
+  # When enabled, agent.hook_hinter counts repeated tool fingerprints (same
+  # tool + arg signature, ignoring observation tools like read_file / cd /
+  # ls / memory). When a fingerprint crosses `hook_suggestions_threshold`,
+  # a one-shot system reminder is appended to the next tool result so the
+  # model can propose a `hermes hooks new` command to the user.
+  #   true:  fire reminders, capped at 3 distinct fingerprints per session (default)
+  #   false: silent — discover candidates only via `hermes hooks suggest`
+  hook_suggestions: true
+  hook_suggestions_threshold: 3
+
   # What Enter does when Hermes is already busy (CLI and gateway platforms).
   #   interrupt: Interrupt the current run and redirect Hermes (default)
   #   queue:     Queue your message for the next turn
@@ -991,17 +1002,42 @@ display:
 # See website/docs/user-guide/features/hooks.md for the full JSON wire
 # protocol and worked examples.
 #
+# === Easiest path: let `hermes hooks new` build the entries for you ===
+#
+#   hermes hooks new                       # interactive picker
+#   hermes hooks new --from-template block-env-write
+#   hermes hooks suggest --lookback-hours 168    # mine sessions for candidates
+#
+# `hermes hooks new` copies the chosen template into ~/.hermes/agent-hooks/,
+# appends a properly indented entry to this `hooks:` block (preserving
+# every comment), runs `hermes hooks doctor`, and prints the first-use
+# allowlist guidance. See skills/productivity/create-hook/SKILL.md.
+#
+# === Manual path ===
+#
+# Starter recipes ship in scripts/agent-hooks-examples/ — copy them in
+# yourself if you don't want the scaffolder:
+#
+#   mkdir -p ~/.hermes/agent-hooks
+#   cp scripts/agent-hooks-examples/*.sh ~/.hermes/agent-hooks/
+#   chmod +x ~/.hermes/agent-hooks/*.sh
+#
 # hooks:
 #   pre_tool_call:
 #     - matcher: "terminal"
-#       command: "~/.hermes/agent-hooks/block-rm-rf.sh"
-#       timeout: 10
+#       command: "~/.hermes/agent-hooks/block-rm-rf.sh"   # blocks `rm -rf /<critical>`
+#       timeout: 5
+#     - matcher: "write_file|patch|terminal"
+#       command: "~/.hermes/agent-hooks/block-env-write.sh"   # blocks .env / *.pem writes
+#       timeout: 5
 #   post_tool_call:
 #     - matcher: "write_file|patch"
-#       command: "~/.hermes/agent-hooks/auto-format.sh"
+#       command: "~/.hermes/agent-hooks/auto-format.sh"   # runs `black` on .py writes
+#     - matcher: "write_file|patch"
+#       command: "~/.hermes/agent-hooks/auto-stage-on-write.sh"   # git-adds written files
 #   pre_llm_call:
-#     - command: "~/.hermes/agent-hooks/inject-cwd-context.sh"
+#     - command: "~/.hermes/agent-hooks/inject-cwd-context.sh"  # adds `git status` to next turn
 #   subagent_stop:
-#     - command: "~/.hermes/agent-hooks/log-orchestration.sh"
+#     - command: "~/.hermes/agent-hooks/log-orchestration.sh"   # (bring your own)
 #
 # hooks_auto_accept: false
