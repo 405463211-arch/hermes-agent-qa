@@ -1,0 +1,12 @@
+# Privacy: never index or send these to LLM providers
+# Format: gitignore-style patterns
+
+# All .private.md files anywhere
+*.private.md
+
+# The whole home-deploy docs directory (含真实域名/UUID/IP/密码)
+.cursor/docs/2026-05-06-home-deploy-cf-tunnel/
+
+# Hermes profile data (含 API key / 会话历史 / 记忆) — 虽然不在这个 repo 里，
+# 但 Cursor 可能跟随 symlink，加上做防御
+~/.hermes/

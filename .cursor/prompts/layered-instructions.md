@@ -14,7 +14,7 @@
 **问题**：`AGENTS.md`、`SKILL.md` 这种 always-applied 或 frequently-loaded 的指令文件，写到 700+ 行后会出现：
 
 1. **token 浪费**——Cursor 每条对话都注入 8k+ tokens，一个 100 turn 会话光指令开销 800k+
-2. **U 型注意力稀释**——长 prompt 中段的硬约束（"不要用 qwen3-vl-flash 做 grounding"、"用 `get_hermes_home()` 不要硬编码 `~/.hermes`"）容易被 LLM 忽略
+2. **U 型注意力稀释**——长 prompt 中段的硬约束（"用 qwen3.6-plus 做 grounding 别回退到旧 qwen3-vl-flash"、"用 `get_hermes_home()` 不要硬编码 `~/.hermes`"）容易被 LLM 忽略
 3. **任务无关污染**——你只想加个工具，却被注入 plugins/skin/TUI 等无关章节
 
 **方案**（Anthropic Skills 的 progressive disclosure 模式）：

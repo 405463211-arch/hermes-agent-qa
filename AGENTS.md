@@ -110,6 +110,8 @@ Read the relevant file *only when your task touches that area*:
 
 | Task | Read |
 |------|------|
+| **Picking which extension point to use** (skill vs subagent vs hook vs MCP vs CLAUDE.md) | `docs/agents/extension-decision.md` |
+| **Authoring / proposing a shell hook** (when to suggest one, `hermes hooks new` / `suggest`) | `skills/productivity/create-hook/SKILL.md` |
 | Project layout / what's in which folder | `docs/agents/project-structure.md` |
 | Editing AIAgent / understanding the conversation loop | `docs/agents/agent-class.md` |
 | Editing CLI / adding a slash command / spinner / banner | `docs/agents/cli-architecture.md` |
@@ -119,10 +121,11 @@ Read the relevant file *only when your task touches that area*:
 | Adding a skin / customizing CLI theme | `docs/agents/skin-theme-system.md` |
 | Writing a plugin (general / memory / context-engine / image-gen) | `docs/agents/plugins.md` |
 | Adding a built-in skill / SKILL.md frontmatter | `docs/agents/skills.md` |
-| Prompt caching policy / background process notifications | `docs/agents/policies.md` |
+| Prompt caching policy / context-file priority / background process notifications | `docs/agents/policies.md` |
 | Profile-safe code patterns | `docs/agents/profiles.md` |
 | Avoiding known footguns | `docs/agents/pitfalls.md` |
 | Running tests / CI parity / change-detector tests | `docs/agents/testing.md` |
+| **Writing / splitting AGENTS.md / SKILL.md** (layered instructions, hard-rule tiers) | `docs/agents/instruction-files.md` |
 
 ## Agent Loop One-liner
 
