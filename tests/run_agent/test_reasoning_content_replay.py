@@ -107,6 +107,10 @@ def test_normalized_reasoning_field_falls_through_when_explicit_missing():
 # ---------------------------------------------------------------------
 
 def test_deepseek_thinking_model_backfills_empty_reasoning_on_tool_call():
+    # Upstream #17341 (v0.13.0 era) tightened DeepSeek V4 Pro validation so
+    # an empty string for ``reasoning_content`` now returns HTTP 400. The
+    # thinking-mode backfill therefore uses a single space, NOT the empty
+    # string that this test originally locked in.
     stub = _make_stub("custom", "https://api.deepseek.com", "deepseek-v4-flash")
     src = {
         "role": "assistant",
@@ -117,15 +121,16 @@ def test_deepseek_thinking_model_backfills_empty_reasoning_on_tool_call():
     api = src.copy()
     stub._copy_reasoning_content_for_api(src, api)
     assert "reasoning_content" in api
-    assert api["reasoning_content"] == ""
+    assert api["reasoning_content"] == " "
 
 
 def test_deepseek_thinking_model_backfills_empty_reasoning_on_text_reply():
+    # See note on the tool-call variant: ``" "`` (not ``""``) per #17341.
     stub = _make_stub("custom", "https://api.deepseek.com", "deepseek-reasoner")
     src = {"role": "assistant", "content": "hello"}
     api = src.copy()
     stub._copy_reasoning_content_for_api(src, api)
-    assert api.get("reasoning_content") == ""
+    assert api.get("reasoning_content") == " "
 
 
 def test_deepseek_chat_model_does_not_backfill_reasoning():
@@ -160,7 +165,9 @@ def test_kimi_still_backfills_after_refactor():
         }
         api = src.copy()
         stub._copy_reasoning_content_for_api(src, api)
-        assert api.get("reasoning_content") == "", (
+        # Same single-space padding now applies to all thinking-mode
+        # backfills (Kimi/Moonshot included) per #17341.
+        assert api.get("reasoning_content") == " ", (
             f"Kimi/Moonshot backfill regressed for "
             f"provider={provider!r} base_url={base_url!r}"
         )
