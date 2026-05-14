@@ -1,16 +1,32 @@
 """Tests for tools/skill_provenance.py — write-origin ContextVar."""
 
 import contextvars
+import threading
 
 import pytest
 
 
 def test_default_origin_is_foreground():
+    """The module-level default for `_write_origin` is "foreground".
+
+    Run the assertion on a brand-new thread so we get a fresh top-level
+    Context — `contextvars.copy_context()` would inherit any value set in
+    pytest's caller context (e.g. by a sibling test that exercised
+    `AIAgent.run_conversation`, which calls `set_current_write_origin`
+    without a paired reset).  A new thread always starts with an empty
+    Context, so the ContextVar's default is what actually gets read.
+    """
     from tools.skill_provenance import get_current_write_origin
-    # In a fresh ContextVar context, default kicks in.
-    ctx = contextvars.copy_context()
-    origin = ctx.run(get_current_write_origin)
-    assert origin == "foreground"
+
+    captured: list[str] = []
+
+    def _read_default():
+        captured.append(get_current_write_origin())
+
+    t = threading.Thread(target=_read_default)
+    t.start()
+    t.join(timeout=5.0)
+    assert captured == ["foreground"]
 
 
 def test_set_and_get_origin():

@@ -441,7 +441,8 @@ class TestExecute:
         cmd, args, kwargs = vercel_sdk.current.run_command_calls[-1]
         assert cmd == "bash"
         assert args[0] == "-c"
-        assert "cd /tmp" in args[1]
+        # `cd --` since edf9c7562 (fix(env): pass -- to cd for hyphen-prefixed workdirs)
+        assert "cd -- /tmp" in args[1]
         assert kwargs["cwd"] == "/vercel/sandbox"
 
     @pytest.mark.parametrize(

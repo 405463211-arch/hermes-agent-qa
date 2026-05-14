@@ -314,7 +314,8 @@ class TestExecute:
         # CWD should be embedded in the command string via _wrap_command
         call_args = sb.process.exec.call_args_list[-1]
         cmd = call_args[0][0]
-        assert "cd /tmp" in cmd
+        # `cd --` since edf9c7562 (fix(env): pass -- to cd for hyphen-prefixed workdirs)
+        assert "cd -- /tmp" in cmd
         # CWD should NOT be passed as a kwarg to exec
         assert "cwd" not in call_args[1]
 

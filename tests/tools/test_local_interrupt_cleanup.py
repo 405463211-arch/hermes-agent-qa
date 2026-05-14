@@ -48,14 +48,33 @@ def _process_group_snapshot(pgid: int) -> str:
     ).stdout.strip()
 
 
-def _wait_for_pgid_exit(pgid: int, timeout: float = 10.0) -> bool:
-    """Wait for a process group to disappear under loaded xdist hosts."""
+def _wait_for_pgid_exit(pgid: int, timeout: float = 30.0) -> bool:
+    """Wait for a process group to disappear under loaded xdist hosts.
+
+    Default 30 s upper bound: under heavily loaded GitHub Actions runners,
+    SIGKILL → reaper → ``killpg(pgid, 0) == ESRCH`` can lag well past 10 s
+    even when the kernel queued the kill immediately. Locally on macOS it
+    completes in <1 s; the headroom is purely for CI host noise.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not _pgid_still_alive(pgid):
             return True
         time.sleep(0.1)
     return not _pgid_still_alive(pgid)
+
+
+def _force_pgid_dead(pgid: int) -> None:
+    """Last-ditch SIGKILL of a process group from inside the test.
+
+    Run on test teardown so a missed-kill regression doesn't leak ``sleep 30``
+    children that survive into other tests / the next pytest run. Not part
+    of the assertion path — that still validates the production cleanup.
+    """
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
 
 
 def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
@@ -94,6 +113,7 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
     """When KeyboardInterrupt arrives mid-poll, the subprocess group must be
     killed before the exception is re-raised."""
     env = LocalEnvironment(cwd="/tmp")
+    pgid_for_cleanup: int | None = None
     try:
         result_holder = {}
         proc_holder = {}
@@ -149,6 +169,7 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             "test setup: couldn't find 'sleep 30' subprocess after 5 s"
         )
         pgid = os.getpgid(target_pid)
+        pgid_for_cleanup = pgid
         assert _pgid_still_alive(pgid), "sanity: subprocess should be alive"
 
         # Now inject a KeyboardInterrupt into the worker thread the same
@@ -167,8 +188,11 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
 
         # Give the worker a moment to: hit the exception at the next poll,
         # run the except-block cleanup (_kill_process), and exit.
-        t.join(timeout=5.0)
-        assert not t.is_alive(), "worker didn't exit within 5 s of the interrupt"
+        # Production cleanup budget: SIGTERM(1s) + SIGKILL(2s) + drain(2s) = ~5s.
+        # On loaded CI hosts that can stretch — give the worker a generous window
+        # rather than racing the assertion.
+        t.join(timeout=15.0)
+        assert not t.is_alive(), "worker didn't exit within 15 s of the interrupt"
 
         # The critical assertion: the subprocess GROUP must be dead.  Not
         # just the bash wrapper — the 'sleep 30' child too. Under xdist load,
@@ -188,6 +212,11 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             f"propagation after cleanup"
         )
     finally:
+        # Belt-and-braces: if the assertion above failed because cleanup was
+        # incomplete, do not leak `sleep 30` (and other group members) into
+        # other tests. The assertion has already recorded the failure.
+        if pgid_for_cleanup is not None:
+            _force_pgid_dead(pgid_for_cleanup)
         try:
             env.cleanup()
         except Exception:

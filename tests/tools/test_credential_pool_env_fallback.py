@@ -3,7 +3,9 @@
 Covers the fix from #15914 / PR #15920:
 - _seed_from_env reads API keys from ~/.hermes/.env when not in os.environ
 - _resolve_api_key_provider_secret falls back to credential_pool when env vars are empty
-- env vars take priority over .env file (handled by get_env_value itself)
+- ~/.hermes/.env takes priority over os.environ for credential_pool seeding
+  (PR #18254 / commit 2ef1ad280: stale env vars from parent processes — Codex
+  CLI, test scripts — must not shadow deliberate edits to the user's .env)
 - env vars take priority over credential pool (fallback only kicks in when env is empty)
 """
 
@@ -106,10 +108,17 @@ class TestCredentialPoolSeedsFromDotEnv:
         assert active_sources == set()
         assert entries == []
 
-    def test_os_environ_still_wins_over_dotenv(self, isolated_hermes_home, monkeypatch):
-        """get_env_value checks os.environ first — verify seeding picks that up."""
-        _write_env_file(isolated_hermes_home, DEEPSEEK_API_KEY="sk-dotenv-stale")
-        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env-fresh-xyz")
+    def test_dotenv_wins_over_os_environ(self, isolated_hermes_home, monkeypatch):
+        """~/.hermes/.env wins over os.environ when seeding the credential pool.
+
+        PR #18254 / commit 2ef1ad280: parent processes (Codex CLI, test scripts)
+        often inherit stale API keys via os.environ.  When the user later edits
+        ~/.hermes/.env with a fresh key, the credential pool must pick the
+        .env value — otherwise auth.json caches the stale key and every API
+        call fails with 401.
+        """
+        _write_env_file(isolated_hermes_home, DEEPSEEK_API_KEY="sk-dotenv-fresh")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env-stale-xyz")
 
         from agent.credential_pool import _seed_from_env
         entries = []
@@ -118,7 +127,7 @@ class TestCredentialPoolSeedsFromDotEnv:
         assert changed is True
         seeded = [e for e in entries if e.source == "env:DEEPSEEK_API_KEY"]
         assert len(seeded) == 1
-        assert seeded[0].access_token == "sk-env-fresh-xyz"
+        assert seeded[0].access_token == "sk-dotenv-fresh"
 
 
 class TestAuthResolvesFromDotEnv:
