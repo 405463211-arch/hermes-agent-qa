@@ -42,7 +42,15 @@ def test_memory_schema_is_well_formed():
     assert params["required"] == ["action", "target"]
     # Nested ``enum`` on property values is fine — only top-level is forbidden.
     assert params["properties"]["action"]["enum"] == ["add", "replace", "remove"]
-    assert params["properties"]["target"]["enum"] == ["memory", "user"]
+    # Anchor (subset) check rather than strict equality: this local fork
+    # extends ``target`` with ``rules`` for the /rules slash-command system
+    # (snapshot 6198fe35f). Upstream's strict-equality assertion does not
+    # know about the local extension, so we assert the upstream-mandated
+    # values are present and let local additions ride along.
+    target_enum = params["properties"]["target"]["enum"]
+    assert set(target_enum) >= {"memory", "user"}, (
+        f"target enum must include upstream's required values, got {target_enum!r}"
+    )
 
 
 def test_memory_schema_is_json_serializable():

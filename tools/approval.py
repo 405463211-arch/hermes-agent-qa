@@ -18,6 +18,7 @@ import time
 import unicodedata
 from typing import Optional
 from hermes_cli.config import cfg_get
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -887,7 +888,9 @@ def check_dangerous_command(command: str, env_type: str,
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
-    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled():
+    # Use is_truthy_value() so false-like strings ("0", "false", "off", ...)
+    # never silently enable bypass — see tests/tools/test_yolo_mode.py.
+    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -1011,8 +1014,14 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    # Use is_truthy_value() so false-like strings ("0", "false", ...) never
+    # silently enable bypass — see tests/tools/test_yolo_mode.py.
     approval_mode = _get_approval_mode()
-    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        is_truthy_value(os.getenv("HERMES_YOLO_MODE"))
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
