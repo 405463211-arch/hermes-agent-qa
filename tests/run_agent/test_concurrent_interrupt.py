@@ -73,6 +73,18 @@ def _make_agent(monkeypatch):
             return False
 
     stub = _Stub()
+    # _execute_tool_calls_concurrent calls self._tool_guardrails.before_call()
+    # for every tool, then self._append_guardrail_observation() after each
+    # call returns. Use a real ToolCallGuardrailController (default-allow) so
+    # the test exercises the real interrupt fanout path; mocking would also
+    # work but a real instance future-proofs against new attributes the
+    # production loop starts reading from the controller.
+    from agent.tool_guardrails import ToolCallGuardrailController
+    stub._tool_guardrails = ToolCallGuardrailController()
+    # Pass-through hook — production wraps the tool's return value with a
+    # guardrail-observation note when the after_call decision is non-allow.
+    # We're not exercising guardrails here, so just return the result as-is.
+    stub._append_guardrail_observation = lambda name, args, result, failed=False: result
     # Bind the real methods under test
     stub._execute_tool_calls_concurrent = _ra.AIAgent._execute_tool_calls_concurrent.__get__(stub)
     stub.interrupt = _ra.AIAgent.interrupt.__get__(stub)
@@ -107,7 +119,9 @@ def test_concurrent_interrupt_cancels_pending(monkeypatch):
 
     original_invoke = agent._invoke_tool
 
-    def slow_tool(name, args, task_id, call_id=None):
+    def slow_tool(name, args, task_id, call_id=None, **kwargs):
+        # **kwargs absorbs new keyword args production may forward to
+        # _invoke_tool over time (e.g. messages=, pre_tool_block_checked=).
         if name == "slow_one":
             # Block until the test sets the interrupt
             barrier.wait(timeout=10)
@@ -184,7 +198,9 @@ def test_running_concurrent_worker_sees_is_interrupted(monkeypatch):
     observed = {"saw_true": False, "poll_count": 0, "worker_tid": None}
     worker_started = threading.Event()
 
-    def polling_tool(name, args, task_id, call_id=None, messages=None):
+    def polling_tool(name, args, task_id, call_id=None, **kwargs):
+        # **kwargs absorbs new keyword args production may forward to
+        # _invoke_tool over time (e.g. messages=, pre_tool_block_checked=).
         observed["worker_tid"] = threading.current_thread().ident
         worker_started.set()
         deadline = time.monotonic() + 5.0

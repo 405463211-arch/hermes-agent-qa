@@ -1569,8 +1569,12 @@ class GatewayRunner:
             return True
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_lobby_reminder_ts.get(chat_id, 0.0)
-        if now - last < self._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S:
+        # ``None`` (not 0.0) marks "never sent": ``time.monotonic()`` returns
+        # an arbitrary epoch — on a freshly booted CI host it can be smaller
+        # than the cooldown, which would make the very first reminder hit
+        # the cooldown branch and never fire.
+        last = self._telegram_lobby_reminder_ts.get(chat_id)
+        if last is not None and now - last < self._TELEGRAM_LOBBY_REMINDER_COOLDOWN_S:
             return False
         self._telegram_lobby_reminder_ts[chat_id] = now
         return True
@@ -10047,8 +10051,12 @@ class GatewayRunner:
             return True
         import time as _time
         now = _time.monotonic()
-        last = self._telegram_capability_hint_ts.get(chat_id, 0.0)
-        if now - last < self._TELEGRAM_CAPABILITY_HINT_COOLDOWN_S:
+        # ``None`` (not 0.0) marks "never sent": ``time.monotonic()`` returns
+        # an arbitrary epoch — on a freshly booted CI host it can be smaller
+        # than the cooldown, which would make the very first hint hit the
+        # cooldown branch and never fire.
+        last = self._telegram_capability_hint_ts.get(chat_id)
+        if last is not None and now - last < self._TELEGRAM_CAPABILITY_HINT_COOLDOWN_S:
             return False
         self._telegram_capability_hint_ts[chat_id] = now
         return True

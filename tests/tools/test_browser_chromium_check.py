@@ -21,6 +21,26 @@ def _reset_chromium_cache():
     bt._cached_chromium_installed = None
 
 
+@pytest.fixture
+def _no_system_chromium(monkeypatch):
+    """Force `_chromium_installed()` to skip the AGENT_BROWSER_EXECUTABLE_PATH
+    and system-Chrome (`shutil.which("google-chrome" / ...)`) probes added in
+    commit 45fd45103. Without this, CI hosts that ship Chrome in PATH (most
+    GitHub Actions runners do) fail the "no Chromium" tests because
+    `_chromium_installed()` short-circuits to True before reaching the
+    Playwright-cache directory scan that the tests are actually exercising.
+    """
+    monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
+    real_which = bt.shutil.which
+
+    def _filtered_which(cmd, *args, **kwargs):
+        if cmd in {"google-chrome", "chromium-browser", "chrome"}:
+            return None
+        return real_which(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(bt.shutil, "which", _filtered_which)
+
+
 class TestChromiumSearchRoots:
     def test_respects_playwright_browsers_path_env(self, monkeypatch, tmp_path):
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
@@ -51,19 +71,19 @@ class TestChromiumInstalled:
         (tmp_path / "chromium_headless_shell-1208").mkdir()
         assert bt._chromium_installed() is True
 
-    def test_false_when_dir_empty(self, monkeypatch, tmp_path):
+    def test_false_when_dir_empty(self, monkeypatch, tmp_path, _no_system_chromium):
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
         monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path / "fakehome"))
         assert bt._chromium_installed() is False
 
-    def test_false_when_only_unrelated_browsers(self, monkeypatch, tmp_path):
+    def test_false_when_only_unrelated_browsers(self, monkeypatch, tmp_path, _no_system_chromium):
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))
         monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path / "fakehome"))
         (tmp_path / "firefox-1234").mkdir()
         (tmp_path / "webkit-5678").mkdir()
         assert bt._chromium_installed() is False
 
-    def test_false_when_path_not_a_dir(self, monkeypatch, tmp_path):
+    def test_false_when_path_not_a_dir(self, monkeypatch, tmp_path, _no_system_chromium):
         # User points PLAYWRIGHT_BROWSERS_PATH at a file by mistake.
         bogus = tmp_path / "nope"
         bogus.write_text("")
@@ -81,7 +101,7 @@ class TestChromiumInstalled:
 
 
 class TestCheckBrowserRequirementsChromium:
-    def test_local_mode_missing_chromium_returns_false(self, monkeypatch, tmp_path):
+    def test_local_mode_missing_chromium_returns_false(self, monkeypatch, tmp_path, _no_system_chromium):
         monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/local/bin/agent-browser")
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _: False)
@@ -133,7 +153,7 @@ class TestRunBrowserCommandChromiumGuard:
     Chromium is missing in local mode.
     """
 
-    def test_local_mode_missing_chromium_returns_error_immediately(self, monkeypatch, tmp_path):
+    def test_local_mode_missing_chromium_returns_error_immediately(self, monkeypatch, tmp_path, _no_system_chromium):
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/local/bin/agent-browser")
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _: False)
         monkeypatch.setattr(bt, "_is_local_mode", lambda: True)
@@ -151,7 +171,7 @@ class TestRunBrowserCommandChromiumGuard:
         assert result["success"] is False
         assert "Chromium" in result["error"]
 
-    def test_docker_hint_mentions_image_pull(self, monkeypatch, tmp_path):
+    def test_docker_hint_mentions_image_pull(self, monkeypatch, tmp_path, _no_system_chromium):
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/local/bin/agent-browser")
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _: False)
         monkeypatch.setattr(bt, "_is_local_mode", lambda: True)
@@ -163,7 +183,7 @@ class TestRunBrowserCommandChromiumGuard:
         assert result["success"] is False
         assert "docker pull" in result["error"].lower()
 
-    def test_non_docker_hint_mentions_agent_browser_install(self, monkeypatch, tmp_path):
+    def test_non_docker_hint_mentions_agent_browser_install(self, monkeypatch, tmp_path, _no_system_chromium):
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/local/bin/agent-browser")
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _: False)
         monkeypatch.setattr(bt, "_is_local_mode", lambda: True)

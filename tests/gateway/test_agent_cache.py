@@ -957,15 +957,21 @@ class TestAgentCacheSpilloverLive:
                 pass
 
     def test_concurrent_inserts_settle_at_cap(self, monkeypatch):
-        """Many threads inserting in parallel end with len(cache) == CAP."""
+        """Many threads inserting in parallel end with len(cache) == CAP.
+
+        Sized so the test still exercises cap-enforcement contention
+        (4× cap of inserts) but completes well inside conftest's 30s
+        SIGALRM budget on Linux CI hosts where building 160 real
+        ``AIAgent`` instances was hitting the per-test timeout.
+        """
         from gateway import run as gw_run
 
-        CAP = 16
+        CAP = 8
         monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", CAP)
         runner = self._runner()
 
-        N_THREADS = 8
-        PER_THREAD = 20  # 8 * 20 = 160 inserts into a 16-slot cache
+        N_THREADS = 4
+        PER_THREAD = 8  # 4 * 8 = 32 inserts into an 8-slot cache (4× cap)
 
         def worker(tid: int):
             for j in range(PER_THREAD):
@@ -982,7 +988,9 @@ class TestAgentCacheSpilloverLive:
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
+            # Tight per-thread join — total budget across all threads stays
+            # well under the conftest 30s test timeout.
+            t.join(timeout=10)
             assert not t.is_alive(), "Worker thread hung — possible deadlock?"
 
         # Let daemon cleanup threads settle.

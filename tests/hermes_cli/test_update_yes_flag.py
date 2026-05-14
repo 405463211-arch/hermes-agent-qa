@@ -135,44 +135,52 @@ class TestUpdateYesConfigMigration:
 class TestUpdateYesStashRestore:
     """--yes auto-restores the pre-update autostash without prompting."""
 
-    @patch("hermes_cli.main._restore_stashed_changes")
-    @patch(
-        "hermes_cli.main._stash_local_changes_if_needed",
-        return_value="stash@{0}",
-    )
-    @patch("hermes_cli.config.check_config_version", return_value=(1, 1))
-    @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
-    @patch("hermes_cli.config.get_missing_env_vars", return_value=[])
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_yes_restores_stash_without_prompting(
-        self,
-        mock_run,
-        _mock_which,
-        _mock_missing_env,
-        _mock_missing_cfg,
-        _mock_version,
-        _mock_stash,
-        mock_restore,
-        capsys,
-    ):
+    def test_yes_restores_stash_without_prompting(self, monkeypatch, capsys):
+        """Drive the same scenario as the @patch-decorated version with
+        ``monkeypatch`` instead.
+
+        The original ``@patch("hermes_cli.main._restore_stashed_changes")``
+        stack failed silently under pytest-xdist on Linux CI workers — the
+        mock object was created but never wired into ``hermes_cli.main``'s
+        module dict, so the real function ran (visible in captured stdout
+        as "Restoring local changes...") and ``mock_restore.called`` stayed
+        False.  ``monkeypatch.setattr`` does the bind synchronously against
+        an explicit module reference and is robust under xdist.
+        """
+        from unittest.mock import MagicMock
+        import sys as _sys
+        import hermes_cli.config as _hcfg
+        import hermes_cli.main as _hmain
+
         # Not on main → cmd_update switches to main → autostash fires.
-        mock_run.side_effect = _make_run_side_effect(
-            branch="feature-branch", verify_ok=True, commit_count="1", dirty=True
-        )
+        mock_run = MagicMock(side_effect=_make_run_side_effect(
+            branch="feature-branch", verify_ok=True, commit_count="1", dirty=True,
+        ))
+        monkeypatch.setattr("subprocess.run", mock_run)
+        monkeypatch.setattr("shutil.which", lambda *_a, **_kw: None)
+        monkeypatch.setattr(_hcfg, "get_missing_env_vars", lambda *_a, **_kw: [])
+        monkeypatch.setattr(_hcfg, "get_missing_config_fields", lambda *_a, **_kw: [])
+        monkeypatch.setattr(_hcfg, "check_config_version", lambda *_a, **_kw: (1, 1))
+
+        mock_stash = MagicMock(return_value="stash@{0}")
+        mock_restore = MagicMock()
+        monkeypatch.setattr(_hmain, "_stash_local_changes_if_needed", mock_stash)
+        monkeypatch.setattr(_hmain, "_restore_stashed_changes", mock_restore)
+
+        # Sanity: confirm the bind landed before driving cmd_update.  If
+        # this fails we want a clean assertion, not a confusing
+        # "mock_restore.called == False" much further down.
+        assert _hmain._restore_stashed_changes is mock_restore
+        assert _hmain._stash_local_changes_if_needed is mock_stash
 
         args = SimpleNamespace(yes=True)
 
         # Force a TTY-shaped session so the autostash-restore branch is
-        # reachable in CI workers regardless of inherited stdio (matches the
-        # isatty patching strategy in ``test_no_yes_flag_still_prompts_in_tty``
-        # — ``patch.object`` on the real streams is robust under xdist).
-        import sys as _sys
+        # reachable regardless of inherited stdio.
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(_sys.stdout, "isatty", lambda: True)
 
-        with patch.object(_sys.stdin, "isatty", return_value=True), patch.object(
-            _sys.stdout, "isatty", return_value=True
-        ):
-            cmd_update(args)
+        cmd_update(args)
 
         # _restore_stashed_changes was called, and called with prompt_user=False
         # every time (so the user never sees "Restore local changes now?").

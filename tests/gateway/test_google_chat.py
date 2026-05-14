@@ -253,6 +253,21 @@ class TestEnvConfigLoading:
         "GOOGLE_CHAT_HOME_CHANNEL_NAME",
     )
 
+    @pytest.fixture(autouse=True)
+    def _force_google_chat_available(self, monkeypatch):
+        """The plugin's ``check_fn`` short-circuits to False when
+        ``google.cloud.pubsub_v1`` isn't importable (CI doesn't install
+        ``google-cloud-pubsub`` — it's not in the ``[all]`` extra). These
+        tests exercise env-var → ``cfg.platforms`` wiring and don't need
+        the runtime GCP libs, so flip the availability flag for the
+        plugin module to True for the duration of each test.
+        """
+        try:
+            from plugins.platforms.google_chat import adapter as _gc_adapter
+        except ImportError:
+            pytest.skip("google_chat plugin not importable")
+        monkeypatch.setattr(_gc_adapter, "GOOGLE_CHAT_AVAILABLE", True)
+
     def _clean_env(self, monkeypatch):
         for v in self._ENV_VARS:
             monkeypatch.delenv(v, raising=False)

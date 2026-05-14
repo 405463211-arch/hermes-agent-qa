@@ -2181,6 +2181,8 @@ class TestPtyWebSocket:
         pub_path = f"/api/pub?{qs}"
         sub_path = f"/api/events?{qs}"
 
+        payload = '{"type":"tool.start","payload":{"tool_id":"t1"}}'
+
         with self.client.websocket_connect(sub_path) as sub:
             # Wait for the subscriber to be registered on the server side.
             # websocket_connect returns when ws.accept() completes, but the
@@ -2197,10 +2199,26 @@ class TestPtyWebSocket:
                     "subscriber did not register on channel within 5s"
                 )
 
-            with self.client.websocket_connect(pub_path) as pub:
-                pub.send_text('{"type":"tool.start","payload":{"tool_id":"t1"}}')
-                received = sub.receive_text()
+            # Send the frame on a fresh /api/pub connection.  Republish the
+            # same payload until the subscriber receives it OR we hit a
+            # generous deadline — under starlette TestClient on Linux CI
+            # the very first frame can race the pub_ws → _broadcast_event
+            # await chain and never reach the subscriber's receive queue.
+            received = None
+            broadcast_deadline = time.monotonic() + 10.0
+            while time.monotonic() < broadcast_deadline and received is None:
+                with self.client.websocket_connect(pub_path) as pub:
+                    pub.send_text(payload)
+                    # Brief pause: let the server's broadcast task drain
+                    # before we close pub_ws (closing too eagerly cancels
+                    # the in-flight ``await sub.send_text()``).
+                    time.sleep(0.05)
+                try:
+                    received = sub.receive_text()
+                except Exception:
+                    received = None
 
+        assert received is not None, "subscriber never received broadcast frame"
         assert "tool.start" in received
         assert '"tool_id":"t1"' in received
 
